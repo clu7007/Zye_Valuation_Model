@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated output (real financial data, regenerated on every run)
+output/**
+!output/**/
+!output/**/.gitkeep
+
+# Editor / OS cruft
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
