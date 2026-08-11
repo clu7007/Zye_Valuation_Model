@@ -16,6 +16,22 @@
 - **Raw Data**：FinMind 原始資料存底
 - 全表公式自動串接（Revenue Build → Income Model → Assumptions → Dashboard），只有黃色格需要手動輸入，其餘改動上游數字會自動連動
 
+## 畫面截圖
+
+以 2330（台積電）為例：
+
+**Income Model** — 季度損益表歷史 + 預測
+
+![Income Model](docs/screenshots/income_model.png)
+
+**Revenue Build** — 營收驅動因子預測
+
+![Revenue Build](docs/screenshots/revenue_build.png)
+
+**Dashboard** — 關鍵指標總覽 + 趨勢圖
+
+![Dashboard](docs/screenshots/dashboard.png)
+
 ## 安裝
 
 需要 Python 3.12（`py -0p` 可檢查已安裝版本）。
