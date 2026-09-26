@@ -14,3 +14,5 @@ output/**
 .idea/
 Thumbs.db
 .DS_Store
+
+.venv-mac/
