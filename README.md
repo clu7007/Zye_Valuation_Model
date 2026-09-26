@@ -5,7 +5,7 @@
 ## 功能
 
 - 輸入股票代碼即自動下載歷史財報、股價、股利資料並建模，支援一次跑多支股票
-- **Income Model**：季度損益表歷史（2024 至今）+ 2026Q2F–2029F 預測
+- **Income Model**：季度損益表歷史（2024 至今）+ 2026Q3F–2027Q4F 逐季預測 + 2028F–2029F 年度預測（最新實績：2026Q2）
 - **Assumptions**：毛利率／費用率／稅率等假設輸入（黃色格＝可編輯）
 - **Revenue Build**：Volume／ASP／Mix／FX 營收驅動因子預測，是全模型預測營收的唯一來源；內建 5 條空白產品線讓你自行輸入名稱與佔比做產品結構試算
 - **Dashboard**：關鍵指標總覽
@@ -49,9 +49,12 @@ pip install -r requirements.txt
 
 ## 使用方式
 
-**方法一：雙擊批次檔（Windows，最簡單）**
+**方法一：雙擊啟動檔（最簡單）**
 
-雙擊根目錄的 `run_income_model.bat`，依提示輸入股票代碼：
+- Windows：雙擊 `run_income_model.bat`
+- macOS：首次先在 Terminal 執行 `chmod +x run_income_model.command`，之後雙擊 `run_income_model.command`（首次會自動建立 `.venv-mac` 並安裝套件；需要 Python 3，可用 `brew install python@3.12`）
+
+依提示輸入股票代碼：
 
 ```
 Stock codes: 2330
@@ -90,7 +93,7 @@ python scripts/add_revenue_build.py --stock 2330
 
 ```text
 .
-├─ run_income_model.bat                     # 主工具的雙擊入口
+├─ run_income_model.bat / .command          # 主工具的雙擊入口（Windows / macOS）
 ├─ scripts/
 │  ├─ build_income_statement_model.py       # 主工具：FinMind → Excel 模型
 │  ├─ add_revenue_build.py                  # 舊模型檔的一次性升級腳本

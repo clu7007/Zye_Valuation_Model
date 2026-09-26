@@ -322,3 +322,28 @@
 - 已用 2059、2330 重新產生驗證：第 43 列高度正確維持 28pt（不再被壓回
   6pt），44 列是獨立的間隔列、45 列是說明文字，逐格掃描確認沒有「文字被
   誤存成公式」的回歸。
+
+## 2026-09-24：2027 拆成四季 + 26Q2 轉實績
+
+- 欄位改為：26Q1、26Q2 為實績；26Q3F、26Q4F、27Q1F～27Q4F 逐季預測；2026F、2027F 為四季加總；2028F、2029F 仍為年度預測。
+  Income Model 由 19 欄變 23 欄。新增常數 `LAST_ACTUAL_KEY`（目前 "26Q2"）與 `SUMMED_ANNUAL_QTRS`，下一季更新時改這兩處與 `COLUMNS`。
+- Assumptions 季度區改 6 欄（B～G = 26Q3F～27Q4F），年度區只剩 2028F、2029F（B、C）。
+- Revenue Build：27Q1F～27Q4F 各自有 Volume／ASP／Mix／FX 假設，基期為去年同季（27Q1、27Q2 用 26 年實績，27Q3、27Q4 用 26Q3F、26Q4F 預測）。2026F、2027F 的成長率列只顯示結果。Model Checks 改成分段檢查（中間夾著年度欄，不能再用單一連續範圍）。
+- PE／PB Band：NTM EPS 的 proxy 改用 2028F ÷4，只用在 27Q2F 起不足四季的欄位；「目前估值」改抓 26Q2。
+- Scenario Analysis：2026F、2027F 的 Base 一律讀 Income Model 該年度欄，2028F、2029F 讀 Assumptions。
+- 預設假設的稅率改為只取稅前淨利為正的季度，避免虧損季算出負稅率。
+- `Callmoemo/scripts/model_reader.py` 表頭上限由 10 欄放寬為 16 欄，否則 PE／PB Band 圖會少掉 27Q2F 之後。
+- 少數股權損益：Income Model 新增「稅後淨利-少數股權損益」列（FinMind `NoncontrollingInterests`，歷史實績 = 稅後淨利 − 歸屬母公司淨利）；預測季度歸屬母公司淨利 = 稅後淨利 − 少數股權損益。Assumptions 新增對應輸入列（季度區第 11 列、年度區第 23 列），預設值沿用最近一季金額（年度為 4 倍）。Scenario EPS 同步扣除。
+- Scenario Analysis 右側（G:K 欄）新增「E. 自訂情境」：營收成長率、毛利率、費用率、少數股權損益四項可直接輸入絕對值（預設連動 Base），自動算 EPS、目標本益比（預設 PE Band 平均）、目標價、漲跌幅；下方「情境假設理由」四格（Bull／Base／Bear／自訂）供手寫理由。
+- Revenue Build 新增 E 段「專案營收疊加」（第 61 列起）：既有業務營收（沿用 Volume/ASP/Mix/FX 成長率）＋最多 5 個專案（得標機率、毛利率、維護費適用、得標後各欄認列營收）＋維護費（費率 × 前幾個曆年累計適用專案營收）。第 18 列營收 = 既有業務 + 專案；Income Model 預測毛利 = 既有業務營收 × Assumptions 毛利率 + 專案毛利；營業費用率仍套總營收。專案設定放 `data/overlays/<股號>.json`，沒有檔案時 E 段為空、模型與舊版相同。Scenario Analysis 2028F／2029F 的 Base 成長率與毛利率改讀 Income Model。2231 設定見 `data/overlays/2231.json`。
+- 2026-09-24 全表單位由億元改為新台幣百萬元（`UNIT = 1e6`，所有標籤同步）。舊模型（億元）不受影響，但重新產生就會是百萬元；`Callmoemo/scripts/model_reader.py` 新增 `unit` 欄位（由 Dashboard 標題判斷），`make_figures.py` 圖表單位標籤跟著換。專案 overlay JSON 的金額單位也是百萬元。
+- Scenario Analysis 重排為單欄（A:E）由上到下：A 情境定義、B 假設、C 損益、D 估值、E 自訂、F 理由、G 圖表；Bear 改為「全沒得標」：overlay 專案的 `bear` 欄位為 1 者（標案）營收與維護費歸零，Revenue Build E 段新增 Bear 專案營收／毛利／總營收列，Bear 不再是 Base − Δ。
+- 股利發放率預設值改為只平均 EPS 為正的年度（原本含虧損年度，2231 曾算出 −48%，讓預測 BVPS 被墊高）；Assumptions 欄寬與說明列自動換行；Scenario 定義列文字縮短。
+- 新增 SOTP Valuation 分頁（機率加權分部估值）：既有業務 = BVPS × PB；各專案 = 折現稅後利潤 + 維護費（2029F 終值倍數），全得標／機率加權／全沒得標三種情況。輸入預設（貼現率 10%、標案增額費用率 10%、稅率 20%、維護費終值 10x、既有業務 PB 1.0x）是佔位，設定在 overlay JSON 的 sotp 欄位。
+- 營業費用改為「既有業務營收 × 既有業務費用率 + 專案營收 × 專案增額費用率（Assumptions 第 27 列）」；營業費用率、稅率預設改為最近四個已公布季度的簡單平均（稅率略過稅前虧損季）；overlay 可設 existing_growth_q（既有業務季成長率）與 project_opex_ratio。Scenario Bear 的費用同樣拆開計算。SOTP 的增額費用率連動 Assumptions。
+- PB Band 新增 2028(F) 欄（2028 年底 BVPS = 27Q4 BVPS + 2028 全年 EPS × (1 − 發放率)）；SOTP 既有業務 PB 預設連動 PB Band 平均 PBR，並新增「PB 法交叉檢查」（2028 年底 BVPS × 平均 PBR，不與專案現值加總以免重複）；SOTP 分頁排在 Scenario Analysis 前。
+- SOTP 新增 E 段「前瞻 PB 法」：2028 年底 BVPS（全得標用主模型 EPS、全沒得標用 Scenario Bear EPS、機率加權依標案權重內插）× 平均 PBR，折現到今天並加期間股利現值；與 D 段（現金流現值法）擇一使用，不加總。
+- PE Band 新增「目標價」區塊：Target P/E（overlay 的 target_pe，2231 = 20.34x）× 6 個月（27Q1 季底）與 12 個月（27Q3 季底）NTM EPS。
+- 2231 拜訪備忘錄完成（build_memo_2231.py）：records/2231_為升/2026Q3/2231為升_拜訪備忘錄_2026Q3.docx；reading_material.md 補 ⑥ 節記錄筆記、公開資料出處與模型假設。
+
+- 2026-09-24 撤回誤套用：研究員只要求討論 Bear 情境，未要求改主模型；已移除 overlay 的 opex_ratio_existing / tax_rate，並還原 SOTP 標案稅率與 Assumptions 預設邏輯。

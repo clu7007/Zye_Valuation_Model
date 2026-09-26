@@ -8,6 +8,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import re
 import sys
 import time
@@ -43,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR   = PROJECT_ROOT / "output" / "models"
 FINMIND_URL  = "https://api.finmindtrade.com/api/v4/data"
 REQUEST_DELAY = 1.5
-UNIT = 1e8  # NT$ -> 億元
+UNIT = 1e6  # NT$ -> 百萬元
 
 BAND_LOOKBACK_YEARS     = 5    # PE / PB band statistics window
 DIVIDEND_LOOKBACK_YEARS = 10   # Dividend history table window
@@ -70,6 +72,7 @@ INCOME_ITEMS: list[tuple[str, str, bool]] = [
     ("PreTaxIncome",                        "稅前淨利",              False),
     ("TAX",                                 "所得稅費用(利益)",      False),
     ("IncomeFromContinuingOperations",      "繼續營業單位稅後淨利",  False),
+    ("NoncontrollingInterests",             "稅後淨利-少數股權損益",  False),
     ("EquityAttributableToOwnersOfParent",  "稅後淨利-歸屬母公司",  False),
     ("OrdinaryShare",                       "普通股本",              True),
     ("EPS",                                 "每股盈餘(元)",          False),
@@ -98,10 +101,14 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("25Q4",      "25Q4",    "qtr_hist"),
     ("2025",      "2025",    "annual_hist"),
     ("26Q1",      "26Q1",    "qtr_hist"),
-    ("26Q2(F)",   "26Q2F",   "qtr_fcast"),
+    ("26Q2",      "26Q2",    "qtr_hist"),
     ("26Q3(F)",   "26Q3F",   "qtr_fcast"),
     ("26Q4(F)",   "26Q4F",   "qtr_fcast"),
     ("2026(F)",   "2026F",   "annual_fcast"),
+    ("27Q1(F)",   "27Q1F",   "qtr_fcast"),
+    ("27Q2(F)",   "27Q2F",   "qtr_fcast"),
+    ("27Q3(F)",   "27Q3F",   "qtr_fcast"),
+    ("27Q4(F)",   "27Q4F",   "qtr_fcast"),
     ("2027(F)",   "2027F",   "annual_fcast"),
     ("2028(F)",   "2028F",   "annual_fcast"),
     ("2029(F)",   "2029F",   "annual_fcast"),
@@ -112,13 +119,13 @@ FIRST_DATA_COL = 2
 COL_IDX: dict[str, int] = {c[1]: FIRST_DATA_COL + i for i, c in enumerate(COLUMNS)}
 COL_LTR: dict[str, str] = {k: get_column_letter(v) for k, v in COL_IDX.items()}
 COL_HDR: dict[str, str] = {c[1]: c[0] for c in COLUMNS}
-LAST_COL = FIRST_DATA_COL + len(COLUMNS) - 1   # 19 = S
+LAST_COL = FIRST_DATA_COL + len(COLUMNS) - 1   # 23 = W
 
 # Quarterly-only column keys, in chronological order (excludes annual columns).
 QTR_KEYS: list[str] = [key for _, key, ctype in COLUMNS
                         if ctype in ("qtr_helper", "qtr_hist", "qtr_fcast")]
 # First quarter with a full trailing 4-quarter window inside QTR_KEYS (24Q4) through
-# the last modeled quarter (26Q4F) — the window used for PE/PB Band charts.
+# the last modeled quarter (27Q4F) — the window used for PE/PB Band charts.
 BAND_QTR_KEYS: list[str] = QTR_KEYS[3:]
 BAND_HIST_QTR_KEYS: list[str] = [k for k in BAND_QTR_KEYS if not k.endswith("F")]
 # Turnover-days window: needs only 1 trailing quarter (not 4), so it can start one
@@ -126,9 +133,18 @@ BAND_HIST_QTR_KEYS: list[str] = [k for k in BAND_QTR_KEYS if not k.endswith("F")
 # model's default 2024 start_year.
 TURN_QTR_KEYS: list[str] = QTR_KEYS[1:]
 TURN_HIST_QTR_KEYS: list[str] = [k for k in TURN_QTR_KEYS if not k.endswith("F")]
+# Latest reported quarter (FinMind has real numbers). Everything after it is a forecast.
+LAST_ACTUAL_KEY = "26Q2"
 # Annual forecast column immediately after the last explicit quarterly forecast column
-# (26Q4F) — used to proxy quarters beyond the model's explicit quarterly horizon.
-PROXY_ANNUAL_KEY = "2027F"
+# (27Q4F) — used to proxy quarters beyond the model's explicit quarterly horizon.
+PROXY_ANNUAL_KEY = "2028F"
+PB_EXTRA_YEAR_KEY = "2028F"   # PB Band's extra year-end column (annual, after the last forecast quarter)
+# Annual columns that are the SUM of four explicit quarter columns (not driven by an
+# annual growth assumption).
+SUMMED_ANNUAL_QTRS = {
+    "2026F": ["26Q1", "26Q2", "26Q3F", "26Q4F"],
+    "2027F": ["27Q1F", "27Q2F", "27Q3F", "27Q4F"],
+}
 
 ANNUAL_KEYS = {"2024", "2025", "2026F", "2027F", "2028F", "2029F"}
 
@@ -142,11 +158,14 @@ RB_COL_LTR: dict[str, str] = {key: get_column_letter(v) for key, v in RB_COL_IDX
 RB_CTYPE:   dict[str, str] = {key: ctype for _, key, ctype in RB_COLUMNS}
 RB_LAST_COL = 1 + len(RB_COLUMNS)
 
-RB_HIST_KEYS     = ["2024", "25Q1", "25Q2", "25Q3", "25Q4", "2025", "26Q1"]
-RB_DRIVER_Q_KEYS = ["26Q2F", "26Q3F", "26Q4F"]
-RB_DRIVER_A_KEYS = ["2027F", "2028F", "2029F"]
-RB_Q_PRIOR_KEY   = {"26Q2F": "25Q2", "26Q3F": "25Q3", "26Q4F": "25Q4"}    # same-quarter-last-year base
-RB_ANN_PRIOR_COL = {"2027F": "2026F", "2028F": "2027F", "2029F": "2028F"}  # prior column within Revenue Build's own forecast row
+RB_HIST_KEYS     = ["2024", "25Q1", "25Q2", "25Q3", "25Q4", "2025", "26Q1", "26Q2"]
+RB_DRIVER_Q_KEYS = ["26Q3F", "26Q4F", "27Q1F", "27Q2F", "27Q3F", "27Q4F"]
+RB_DRIVER_A_KEYS = ["2028F", "2029F"]
+RB_ANN_SUM_KEYS  = ["2026F", "2027F"]                 # annual = sum of quarters, no driver inputs
+RB_NONDRIVER_KEYS = RB_HIST_KEYS + RB_ANN_SUM_KEYS
+RB_Q_PRIOR_KEY   = {"26Q3F": "25Q3", "26Q4F": "25Q4",
+                    "27Q1F": "26Q1", "27Q2F": "26Q2", "27Q3F": "26Q3F", "27Q4F": "26Q4F"}   # same-quarter-last-year base
+RB_ANN_PRIOR_COL = {"2028F": "2027F", "2029F": "2028F"}  # prior column within Revenue Build's own forecast row
 
 # Revenue Build row numbers (fixed layout — see build_revenue_build_sheet).
 RB_HIST_REVENUE_ROW     = 5    # historical Revenue (references Income Model)
@@ -159,6 +178,18 @@ RB_OVERRIDE_ROW         = 15
 RB_APPLIED_GROWTH_ROW   = 16
 RB_FORECAST_REVENUE_ROW = 18
 
+# Revenue Build section E (project revenue overlay) — fixed layout, referenced by
+# Income Model gross-profit formulas, so the row numbers must be known up front.
+OV_SEC, OV_HDR, OV_BASE, OV_P0 = 61, 62, 63, 64
+OV_BLK, OV_N = 7, 5                      # rows per project block, number of project blocks
+OV_M0 = OV_P0 + OV_BLK * OV_N            # maintenance block start
+OV_MAINT_RATE, OV_MAINT_GM, OV_MAINT_REV, OV_MAINT_GP = OV_M0, OV_M0 + 1, OV_M0 + 2, OV_M0 + 3
+OV_TOT_PROJ_REV, OV_TOT_PROJ_GP, OV_TOT_REV = OV_M0 + 5, OV_M0 + 6, OV_M0 + 7
+# Bear scenario ("no tender won"): tender-flagged projects and their maintenance fees zeroed
+OV_BEAR_MAINT, OV_BEAR_PROJ_REV, OV_BEAR_GP, OV_BEAR_TOT = OV_M0 + 9, OV_M0 + 10, OV_M0 + 11, OV_M0 + 12
+OV_NOTE = OV_M0 + 14
+OVERLAY_DIR = PROJECT_ROOT / "data" / "overlays"
+
 # PE Band cell addresses (fixed layout — see build_pe_band_sheet) reused by
 # Scenario Analysis and Backtest so both stay live if these are hand-edited.
 PE_BAND_MEAN_CELL  = "$B$4"
@@ -166,6 +197,8 @@ PE_BAND_SD_CELL    = "$B$5"
 PE_BAND_LATEST_PRICE_ROW = 26   # = READ_HDR+1 in build_pe_band_sheet, given the current 6-row BAND_ROWS layout
 
 SCENARIO_SHEET = "Scenario Analysis"
+SOTP_SHEET = "SOTP Valuation"
+SC_BEAR_EPS_ROW = 41   # Scenario Analysis: Bear EPS row (R_BEAR + 4); asserted in build_scenario_analysis_sheet
 BACKTEST_SHEET = "Backtest"
 SCENARIO_YEARS = ["2026F", "2027F", "2028F", "2029F"]
 
@@ -198,26 +231,29 @@ MARGIN_START = MARGIN_HDR + 1                  # 45
 MARGIN_END   = MARGIN_START + len(MARGIN_ITEMS) - 1  # 49
 
 # ── Assumptions cell addresses ────────────────────────────────────────────────
-# Quarterly section rows  (cols B=26Q2F, C=26Q3F, D=26Q4F)
+# Quarterly section rows  (cols B..G = 26Q3F, 26Q4F, 27Q1F..27Q4F)
 A_Q_REV_R    = 5
 A_Q_GM_R     = 6    # gross margin rate
 A_Q_OPEX_R   = 7    # opex ratio
-A_Q_NONOP_R  = 8    # non-op income (億元)
+A_Q_NONOP_R  = 8    # non-op income (百萬元)
 A_Q_TAX_R    = 9    # tax rate
-A_Q_CAP_R    = 10   # ordinary share (億元)
-A_Q_COL      = {"26Q2F": "B", "26Q3F": "C", "26Q4F": "D"}
+A_Q_CAP_R    = 10   # ordinary share (百萬元)
+A_Q_NCI_R    = 11   # non-controlling-interest share of net income (百萬元, negative = minorities absorb a loss)
+A_Q_COL      = {"26Q3F": "B", "26Q4F": "C", "27Q1F": "D", "27Q2F": "E", "27Q3F": "F", "27Q4F": "G"}
 
-# Annual section rows  (cols B=2027F, C=2028F, D=2029F)
+# Annual section rows  (cols B=2028F, C=2029F)
 A_ANN_GROWTH_R = 17
 A_ANN_GM_R     = 18
 A_ANN_OPEX_R   = 19
 A_ANN_NONOP_R  = 20
 A_ANN_TAX_R    = 21
 A_ANN_CAP_R    = 22
-A_ANN_COL      = {"2027F": "B", "2028F": "C", "2029F": "D"}
+A_ANN_NCI_R    = 23
+A_ANN_COL      = {"2028F": "B", "2029F": "C"}
 
 # Section C: Valuation assumptions (single-value cells, col B)
 A_BAND_LOOKBACK_R = 28   # PE/PB band lookback window, years (bake-time only)
+A_PROJ_OPEX_R     = 27   # incremental opex ratio on project revenue (one value, all forecast periods)
 A_PAYOUT_R        = 29   # dividend payout ratio assumption (drives PB Band forward BVPS, live)
 
 # ── Styles ────────────────────────────────────────────────────────────────────
@@ -266,6 +302,16 @@ def _cfill(ctype: str) -> PatternFill:
     return FILL_CREAM
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
+def load_overlay(stock_id: str) -> dict:
+    """Optional per-stock project-revenue overlay (data/overlays/<stock>.json). Absent
+    file = empty overlay: section E stays blank and the model behaves exactly as before."""
+    path = OVERLAY_DIR / f"{stock_id}.json"
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--stocks", nargs="+", required=True)
@@ -340,7 +386,7 @@ BS_EXTRA_TYPES = {
 
 
 def build_bs_extra_data(bs_df: pd.DataFrame | None) -> dict[str, dict[str, float]]:
-    """Quarterly working-capital + book-value balances, in 億元, keyed by our own
+    """Quarterly working-capital + book-value balances, in 百萬元, keyed by our own
     internal names (see BS_EXTRA_TYPES) to avoid the FinMind name collision above."""
     result: dict[str, dict[str, float]] = {}
     if bs_df is None or bs_df.empty:
@@ -444,21 +490,27 @@ def _a_ann(col: str, row: int) -> str:      # Assumptions annual cell
 
 
 def _qtr_fcast_formula(tc: str, cl: str, ir: dict, ac: str, key: str) -> str:
-    """Formula for 26Q2F / 26Q3F / 26Q4F column cells."""
+    """Formula for forecast-quarter column cells (26Q3F .. 27Q4F)."""
     rev = ir["Revenue"]; gp = ir["GrossProfit"]; opex = ir["OperatingExpenses"]
     oi  = ir["OperatingIncome"]; nonop = ir["TotalNonoperatingIncomeAndExpense"]
     pt  = ir["PreTaxIncome"]; tax = ir["TAX"]; ni = ir["IncomeFromContinuingOperations"]
     nip = ir["EquityAttributableToOwnersOfParent"]; cap = ir["OrdinaryShare"]
+    nci = ir["NoncontrollingInterests"]
     a = lambda r: _a_q(ac, r)
     c = lambda r: f"{cl}{r}"
     if tc == "Revenue":
         return f"=IFERROR('{REVENUE_BUILD_SHEET}'!{RB_COL_LTR[key]}{RB_FORECAST_REVENUE_ROW},\"\")"
     elif tc == "GrossProfit":
-        return _ie(f"{c(rev)}*{a(A_Q_GM_R)}")
+        # existing-business revenue x assumed margin + project gross profit (Revenue Build E)
+        rc = RB_COL_LTR[key]
+        return _ie(f"({c(rev)}-'{REVENUE_BUILD_SHEET}'!{rc}{OV_TOT_PROJ_REV})*{a(A_Q_GM_R)}"
+                   f"+'{REVENUE_BUILD_SHEET}'!{rc}{OV_TOT_PROJ_GP}")
     elif tc == "CostOfGoodsSold":
         return _ie(f"{c(rev)}-{c(gp)}")
     elif tc == "OperatingExpenses":
-        return _ie(f"{c(rev)}*{a(A_Q_OPEX_R)}")
+        # existing business x its opex ratio + project revenue x incremental ratio
+        prj = f"'{REVENUE_BUILD_SHEET}'!{RB_COL_LTR[key]}{OV_TOT_PROJ_REV}"
+        return _ie(f"({c(rev)}-{prj})*{a(A_Q_OPEX_R)}+{prj}*Assumptions!$B${A_PROJ_OPEX_R}")
     elif tc == "OperatingIncome":
         return _ie(f"{c(gp)}-{c(opex)}")
     elif tc == "TotalNonoperatingIncomeAndExpense":
@@ -469,8 +521,10 @@ def _qtr_fcast_formula(tc: str, cl: str, ir: dict, ac: str, key: str) -> str:
         return _ie(f"{c(pt)}*{a(A_Q_TAX_R)}")
     elif tc == "IncomeFromContinuingOperations":
         return _ie(f"{c(pt)}-{c(tax)}")
+    elif tc == "NoncontrollingInterests":
+        return f"={a(A_Q_NCI_R)}"
     elif tc == "EquityAttributableToOwnersOfParent":
-        return _ie(f"{c(ni)}")
+        return _ie(f"{c(ni)}-{c(nci)}")
     elif tc == "OrdinaryShare":
         return f"={a(A_Q_CAP_R)}"
     elif tc == "EPS":
@@ -479,22 +533,26 @@ def _qtr_fcast_formula(tc: str, cl: str, ir: dict, ac: str, key: str) -> str:
 
 
 def _ann_fcast_formula(tc: str, cl: str, pcl: str, ir: dict, ac: str, key: str) -> str:
-    """Formula for 2027F / 2028F / 2029F column cells."""
+    """Formula for 2028F / 2029F column cells (2026F / 2027F are quarter sums)."""
     rev = ir["Revenue"]; gp = ir["GrossProfit"]; opex = ir["OperatingExpenses"]
     oi  = ir["OperatingIncome"]; nonop = ir["TotalNonoperatingIncomeAndExpense"]
     pt  = ir["PreTaxIncome"]; tax = ir["TAX"]; ni = ir["IncomeFromContinuingOperations"]
     nip = ir["EquityAttributableToOwnersOfParent"]; cap = ir["OrdinaryShare"]
+    nci = ir["NoncontrollingInterests"]
     a = lambda r: _a_ann(ac, r)
     c = lambda r: f"{cl}{r}"
     p = lambda r: f"{pcl}{r}"
     if tc == "Revenue":
         return f"=IFERROR('{REVENUE_BUILD_SHEET}'!{RB_COL_LTR[key]}{RB_FORECAST_REVENUE_ROW},\"\")"
     elif tc == "GrossProfit":
-        return _ie(f"{c(rev)}*{a(A_ANN_GM_R)}")
+        rc = RB_COL_LTR[key]
+        return _ie(f"({c(rev)}-'{REVENUE_BUILD_SHEET}'!{rc}{OV_TOT_PROJ_REV})*{a(A_ANN_GM_R)}"
+                   f"+'{REVENUE_BUILD_SHEET}'!{rc}{OV_TOT_PROJ_GP}")
     elif tc == "CostOfGoodsSold":
         return _ie(f"{c(rev)}-{c(gp)}")
     elif tc == "OperatingExpenses":
-        return _ie(f"{c(rev)}*{a(A_ANN_OPEX_R)}")
+        prj = f"'{REVENUE_BUILD_SHEET}'!{RB_COL_LTR[key]}{OV_TOT_PROJ_REV}"
+        return _ie(f"({c(rev)}-{prj})*{a(A_ANN_OPEX_R)}+{prj}*Assumptions!$B${A_PROJ_OPEX_R}")
     elif tc == "OperatingIncome":
         return _ie(f"{c(gp)}-{c(opex)}")
     elif tc == "TotalNonoperatingIncomeAndExpense":
@@ -505,8 +563,10 @@ def _ann_fcast_formula(tc: str, cl: str, pcl: str, ir: dict, ac: str, key: str) 
         return _ie(f"{c(pt)}*{a(A_ANN_TAX_R)}")
     elif tc == "IncomeFromContinuingOperations":
         return _ie(f"{c(pt)}-{c(tax)}")
+    elif tc == "NoncontrollingInterests":
+        return f"={a(A_ANN_NCI_R)}"
     elif tc == "EquityAttributableToOwnersOfParent":
-        return _ie(f"{c(ni)}")
+        return _ie(f"{c(ni)}-{c(nci)}")
     elif tc == "OrdinaryShare":
         return f"={a(A_ANN_CAP_R)}"
     elif tc == "EPS":
@@ -514,29 +574,31 @@ def _ann_fcast_formula(tc: str, cl: str, pcl: str, ir: dict, ac: str, key: str) 
     return ""
 
 
-def _2026f_formula(tc: str, row: int, ir: dict) -> str:
-    """Sum formula for 2026(F) annual column."""
-    L, M, N, O = COL_LTR["26Q1"], COL_LTR["26Q2F"], COL_LTR["26Q3F"], COL_LTR["26Q4F"]
-    P = COL_LTR["2026F"]
+def _year_sum_formula(tc: str, row: int, ir: dict, key: str) -> str:
+    """Sum formula for the 2026(F) / 2027(F) annual columns (four quarter columns)."""
+    qcols = [COL_LTR[k] for k in SUMMED_ANNUAL_QTRS[key]]
+    P = COL_LTR[key]
     if tc in BS_TYPES:
-        return f"={O}{row}"
+        return f"={qcols[-1]}{row}"
     if tc == EPS_TYPE:
         nip = ir["EquityAttributableToOwnersOfParent"]
         cap = ir["OrdinaryShare"]
         return _ie(f"{P}{nip}/{P}{cap}*10")
-    return _ie(f"{L}{row}+{M}{row}+{N}{row}+{O}{row}")
+    return _ie("+".join(f"{c}{row}" for c in qcols))
 
 
 # ── QoQ / YoY ────────────────────────────────────────────────────────────────
 _QOQ_PREV = {
     "25Q1": "24Q4", "25Q2": "25Q1", "25Q3": "25Q2", "25Q4": "25Q3",
-    "26Q1": "25Q4", "26Q2F": "26Q1", "26Q3F": "26Q2F", "26Q4F": "26Q3F",
+    "26Q1": "25Q4", "26Q2": "26Q1", "26Q3F": "26Q2", "26Q4F": "26Q3F",
+    "27Q1F": "26Q4F", "27Q2F": "27Q1F", "27Q3F": "27Q2F", "27Q4F": "27Q3F",
 }
 
 _YOY_PREV = {
     "25Q1": "24Q1", "25Q2": "24Q2", "25Q3": "24Q3", "25Q4": "24Q4",
     "2025": "2024",
-    "26Q1": "25Q1", "26Q2F": "25Q2", "26Q3F": "25Q3", "26Q4F": "25Q4",
+    "26Q1": "25Q1", "26Q2": "25Q2", "26Q3F": "25Q3", "26Q4F": "25Q4",
+    "27Q1F": "26Q1", "27Q2F": "26Q2", "27Q3F": "26Q3F", "27Q4F": "26Q4F",
     "2026F": "2025", "2027F": "2026F", "2028F": "2027F", "2029F": "2028F",
 }
 
@@ -558,11 +620,11 @@ def f_yoy(key: str, src_row: int) -> str | None:
 def _ntm_formula(key: str, eps_row: int, data: dict | None = None) -> str:
     """12-month-forward EPS as of `key`'s quarter-end: sum of the next 4 quarterly
     EPS cells in Income Model. Where fewer than 4 explicit quarterly columns remain
-    (only true for 26Q1 and the 3 forecast quarters), the missing quarters are
+    (only true for the last 3 modeled quarters, 27Q2F-27Q4F), the missing quarters are
     proxied at PROXY_ANNUAL_KEY/4 each — the standard way to extend a quarterly
     model past its explicit forecast horizon.
 
-    Income Model's 26Q2F/26Q3F/26Q4F columns are a fixed template, not date-aware —
+    Income Model's forecast-quarter columns are a fixed template, not date-aware —
     they keep running the forecast formula even after FinMind has real reported
     results for that quarter (this happens routinely, since a quarter is usually
     reported within ~1.5 quarters of its end). When `data` is supplied and FinMind
@@ -734,7 +796,7 @@ def build_model_sheet(wb: Workbook, stock_id: str, data: dict) -> dict:
     mr  = {ml: MARGIN_START + i for i, (ml, _, _) in enumerate(MARGIN_ITEMS)}
     yir = {tc: YOY_START + i for i, (tc, _, _) in enumerate(INCOME_ITEMS)}
 
-    ann_prev_key = {"2027F": "2026F", "2028F": "2027F", "2029F": "2028F"}
+    ann_prev_key = {"2028F": "2027F", "2029F": "2028F"}
 
     # Cream background sweep
     for r in range(1, MARGIN_END + 5):
@@ -743,7 +805,7 @@ def build_model_sheet(wb: Workbook, stock_id: str, data: dict) -> dict:
 
     # Title
     ws.merge_cells(start_row=TITLE_ROW, start_column=1, end_row=TITLE_ROW, end_column=LAST_COL)
-    t = ws.cell(TITLE_ROW, 1, f"{stock_id}  季度損益表   單位：新台幣億元")
+    t = ws.cell(TITLE_ROW, 1, f"{stock_id}  季度損益表   單位：新台幣百萬元")
     t.font = _f(bold=True, size=12, color="7A0000"); t.alignment = ALIGN_C
     ws.row_dimensions[TITLE_ROW].height = 22
 
@@ -787,8 +849,8 @@ def build_model_sheet(wb: Workbook, stock_id: str, data: dict) -> dict:
             if ctype == "qtr_fcast":
                 cell.value = _qtr_fcast_formula(tc, COL_LTR[key], ir, A_Q_COL[key], key)
             elif ctype == "annual_fcast":
-                if key == "2026F":
-                    cell.value = _2026f_formula(tc, row, ir)
+                if key in SUMMED_ANNUAL_QTRS:
+                    cell.value = _year_sum_formula(tc, row, ir, key)
                 else:
                     pk  = ann_prev_key[key]
                     cell.value = _ann_fcast_formula(
@@ -870,7 +932,9 @@ def build_model_sheet(wb: Workbook, stock_id: str, data: dict) -> dict:
 
 # ── Build Assumptions ─────────────────────────────────────────────────────────
 def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
-                             payout_def: float | None, band_lookback_years: int) -> None:
+                             payout_def: float | None, band_lookback_years: int,
+                             overlay: dict | None = None) -> None:
+    overlay = overlay or {}
     ws = wb.create_sheet(ASSUMPTIONS_SHEET)
     ws.sheet_properties.tabColor = "7A0000"
 
@@ -898,26 +962,52 @@ def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
         c.number_format = fmt
 
     # ── Compute smart defaults from historical data ──────────────────────────
+    # Positive denominator only: a loss quarter's pre-tax income would give a
+    # meaningless (negative / >100%) tax-rate default.
     def _ratio(num_tc: str, den_tc: str) -> float | None:
         nd, dd = data.get(num_tc, {}), data.get(den_tc, {})
-        for qk in ["26Q1", "25Q4", "25Q3", "25Q2"]:
+        for qk in [LAST_ACTUAL_KEY, "26Q1", "25Q4", "25Q3", "25Q2"]:
             n, d = nd.get(qk), dd.get(qk)
-            if n and d and d != 0:
+            if n and d and d > 0:
                 return round(n / d, 4)
         return None
 
     def _latest(tc: str) -> float | None:
         td = data.get(tc, {})
-        for qk in ["26Q1", "25Q4", "25Q3", "25Q2"]:
+        for qk in [LAST_ACTUAL_KEY, "26Q1", "25Q4", "25Q3", "25Q2"]:
             v = td.get(qk)
             if v is not None:
                 return round(v / UNIT, 1) if tc != EPS_TYPE else v
         return None
 
     gm_def   = _ratio("GrossProfit", "Revenue")
-    opex_def = _ratio("OperatingExpenses", "Revenue")
-    tax_def  = _ratio("TAX", "PreTaxIncome")
+    def _recent_avg(fn, n: int = 4) -> float | None:
+        """Simple average of fn(quarter) over the latest `n` reported quarters where fn is defined."""
+        vals = []
+        for qk in reversed([k for k in QTR_KEYS if not k.endswith("F")]):
+            v = fn(qk)
+            if v is not None:
+                vals.append(v)
+            if len(vals) == n:
+                break
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    def _opex_q(qk):
+        o, r = data.get("OperatingExpenses", {}).get(qk), data.get("Revenue", {}).get(qk)
+        return o / r if (o is not None and r and r > 0) else None
+
+    def _tax_q(qk):   # loss quarters (pre-tax <= 0) have no meaningful effective rate: skipped
+        t, pt = data.get("TAX", {}).get(qk), data.get("PreTaxIncome", {}).get(qk)
+        return t / pt if (t is not None and pt and pt > 0) else None
+
+    opex_def = _recent_avg(_opex_q, 4)
+    tax_def  = _recent_avg(_tax_q, 4)
     cap_def  = _latest("OrdinaryShare")
+    # NCI default = latest reported quarter's run-rate (annual = 4x). Bare number, not a
+    # ratio: a ratio to net income blows up when net income is near zero or negative.
+    nci_q = data.get("NoncontrollingInterests", {}).get(LAST_ACTUAL_KEY)
+    nci_def_q = round(nci_q / UNIT, 3) if nci_q is not None else 0
+    nci_def_a = round(nci_def_q * 4, 3)
 
     # Title
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
@@ -927,27 +1017,28 @@ def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
 
     ws.row_dimensions[2].height = 6   # spacer
 
-    # ── Section A: Quarterly 26Q2F–Q4F (rows 3–11) ──────────────────────────
-    _sec(ws, 3, "短期季度假設 (2026 Q2 ~ Q4)  — 公式將從此處引用", end_col=7)
-    _hdr(4, ["假設項目", "26Q2(F)", "26Q3(F)", "26Q4(F)"])
+    # ── Section A: Quarterly 26Q3F–27Q4F (rows 3–11) ────────────────────────
+    _sec(ws, 3, "季度假設 (2026 Q3 ~ 2027 Q4)  — 公式將從此處引用", end_col=7)
+    _hdr(4, ["假設項目", "26Q3(F)", "26Q4(F)", "27Q1(F)", "27Q2(F)", "27Q3(F)", "27Q4(F)"])
 
     # 營業收入淨額 (Revenue) is intentionally NOT in this list — Revenue Build is now
     # the single source of truth for revenue, so its Assumptions row is built as a
     # read-only formula link below instead of a free-input cell (see A_Q_REV_R block).
     q_params = [
-        (A_Q_GM_R,    "毛利率",                       gm_def,   FMT_PCT),
-        (A_Q_OPEX_R,  "營業費用率",                   opex_def, FMT_PCT),
-        (A_Q_NONOP_R, "營業外收入及支出合計 (億元)",  0,        FMT_100M),
+        (A_Q_GM_R,    "毛利率（既有業務；專案另計）",  gm_def,   FMT_PCT),
+        (A_Q_OPEX_R,  "營業費用率（既有業務；專案另計）", opex_def, FMT_PCT),
+        (A_Q_NONOP_R, "營業外收入及支出合計 (百萬元)",  0,        FMT_100M),
         (A_Q_TAX_R,   "稅率",                         tax_def,  FMT_PCT),
-        (A_Q_CAP_R,   "普通股本 (億元)",              cap_def,  FMT_100M),
+        (A_Q_CAP_R,   "普通股本 (百萬元)",              cap_def,  FMT_100M),
+        (A_Q_NCI_R,   "少數股權損益 (百萬元，負數=少數股東分擔虧損)", nci_def_q, FMT_100M),
     ]
     for row, label, default, fmt in q_params:
         _lbl(row, label)
-        for col_offset in range(2, 5):   # B, C, D
+        for col_offset in range(2, 8):   # B..G
             _inp(row, col_offset, default, fmt)
 
     # 營業收入淨額 — read-only, linked to Revenue Build (see build_revenue_build_sheet)
-    rev_lbl = ws.cell(A_Q_REV_R, 1, "營業收入淨額 (億元) — 由 Revenue Build 計算")
+    rev_lbl = ws.cell(A_Q_REV_R, 1, "營業收入淨額 (百萬元) — 由 Revenue Build 計算")
     rev_lbl.font = _f(size=9); rev_lbl.fill = FILL_CREAM
     rev_lbl.alignment = ALIGN_L; rev_lbl.border = BORDER_D
     ws.row_dimensions[A_Q_REV_R].height = 15
@@ -957,40 +1048,43 @@ def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
         c.font = _f(size=9); c.fill = FILL_CREAM
         c.alignment = ALIGN_R; c.border = BORDER_D; c.number_format = FMT_100M
 
-    ws.row_dimensions[11].height = 6    # spacer
 
     # note
     ws.merge_cells(start_row=12, start_column=1, end_row=12, end_column=7)
-    n = ws.cell(12, 1, "Income Model 26Q2~Q4 各損益項目均引用上表假設推算。請直接在黃色格子輸入數值。")
-    n.font = _f(size=8, color="666666"); n.fill = FILL_CREAM
-    ws.row_dimensions[12].height = 13
+    n = ws.cell(12, 1, "Income Model 26Q3 ~ 27Q4 各季損益項目均引用上表假設推算，2026(F)／2027(F) 為四季加總。請直接在黃色格子輸入數值。"
+        "歸屬母公司淨利 = 稅後淨利 − 少數股權損益，預設值沿用最近一季實績金額。"
+        "毛利率與營業費用率只適用既有業務營收；專案營收（Revenue Build E 段）的毛利率在該段各專案自行設定，"
+        "營業費用另以「專案增額營業費用率」（估值假設區）計算。稅率、營業費用率預設值 = 最近四個已公布季度的簡單平均（稅率略過稅前虧損的季度）。")
+    n.font = _f(size=8, color="666666"); n.fill = FILL_CREAM; n.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[12].height = 40
 
     ws.merge_cells(start_row=13, start_column=1, end_row=13, end_column=7)
     n_rev = ws.cell(13, 1,
         "營收成長率由 Revenue Build 中出貨量、平均售價、產品組合、匯率等營運驅動因子推導；"
         "如需人工覆蓋，請於 Revenue Build 的「人工覆蓋」欄位輸入。")
-    n_rev.font = _f(size=8, color="7A0000"); n_rev.fill = FILL_CREAM
-    ws.row_dimensions[13].height = 26
+    n_rev.font = _f(size=8, color="7A0000"); n_rev.fill = FILL_CREAM; n_rev.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[13].height = 28
 
     # ── Section B: Annual 2027F–2029F (rows 14–22) ──────────────────────────
-    _sec(ws, 14, "年度長期假設 (2027F ~ 2029F)  — 公式將從此處引用", end_col=7)
-    _hdr(15, ["假設項目", "2027(F)", "2028(F)", "2029(F)"])
+    _sec(ws, 14, "年度長期假設 (2028F ~ 2029F)  — 公式將從此處引用（2027 已拆成四季，見上表）", end_col=7)
+    _hdr(15, ["假設項目", "2028(F)", "2029(F)"])
 
     # 營收成長率 YoY is intentionally NOT in this list — same reason as above.
     ann_params = [
-        (A_ANN_GM_R,     "毛利率",                          gm_def,   FMT_PCT),
-        (A_ANN_OPEX_R,   "營業費用率",                      opex_def, FMT_PCT),
-        (A_ANN_NONOP_R,  "營業外收入及支出合計 (億元)",     0,        FMT_100M),
+        (A_ANN_GM_R,     "毛利率（既有業務；專案另計）",     gm_def,   FMT_PCT),
+        (A_ANN_OPEX_R,   "營業費用率（既有業務；專案另計）",  opex_def, FMT_PCT),
+        (A_ANN_NONOP_R,  "營業外收入及支出合計 (百萬元)",     0,        FMT_100M),
         (A_ANN_TAX_R,    "稅率",                            tax_def,  FMT_PCT),
-        (A_ANN_CAP_R,    "普通股本 (億元)",                 cap_def,  FMT_100M),
+        (A_ANN_CAP_R,    "普通股本 (百萬元)",                 cap_def,  FMT_100M),
+        (A_ANN_NCI_R,    "少數股權損益 (百萬元，全年，負數=少數股東分擔虧損)", nci_def_a, FMT_100M),
     ]
     for row, label, default, fmt in ann_params:
         _lbl(row, label)
-        for col_offset in range(2, 5):
+        for col_offset in range(2, 4):   # B, C
             _inp(row, col_offset, default, fmt)
 
     # 營收成長率 YoY — read-only, linked to Revenue Build
-    growth_lbl = ws.cell(A_ANN_GROWTH_R, 1, "營收成長率 YoY（由 Revenue Build 計算）")
+    growth_lbl = ws.cell(A_ANN_GROWTH_R, 1, "營收成長率 YoY（既有業務，由 Revenue Build 計算）")
     growth_lbl.font = _f(size=9); growth_lbl.fill = FILL_CREAM
     growth_lbl.alignment = ALIGN_L; growth_lbl.border = BORDER_D
     ws.row_dimensions[A_ANN_GROWTH_R].height = 15
@@ -1000,22 +1094,24 @@ def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
         c.font = _f(size=9); c.fill = FILL_CREAM
         c.alignment = ALIGN_R; c.border = BORDER_D; c.number_format = FMT_PCT
 
-    ws.row_dimensions[23].height = 6
 
     # note
     ws.merge_cells(start_row=24, start_column=1, end_row=24, end_column=7)
     n2 = ws.cell(24, 1,
         "說明：修改後請儲存，Income Model 各損益科目與 Dashboard 圖表將自動更新。"
         "  預設值已參照最近一季歷史數據填入。")
-    n2.font = _f(size=8, color="7A0000"); n2.fill = FILL_CREAM
-    ws.row_dimensions[24].height = 13
+    n2.font = _f(size=8, color="7A0000"); n2.fill = FILL_CREAM; n2.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[24].height = 28
 
     ws.row_dimensions[25].height = 6
+    ws.row_dimensions[16].height = 6
 
     # ── Section C: Valuation assumptions (rows 26-30) ────────────────────────
     _sec(ws, 26, "估值假設 Valuation Assumptions", end_col=7)
     _lbl(A_BAND_LOOKBACK_R, "PE/PB 河流圖回溯年數 (年)")
     _inp(A_BAND_LOOKBACK_R, 2, band_lookback_years, FMT_YEAR)
+    _lbl(A_PROJ_OPEX_R, "專案增額營業費用率（佔專案營收，所有預測期共用）")
+    _inp(A_PROJ_OPEX_R, 2, overlay.get("project_opex_ratio"), FMT_PCT)
     _lbl(A_PAYOUT_R, "股利發放率假設 (預測 BVPS 用)")
     _inp(A_PAYOUT_R, 2, payout_def, FMT_PCT)
 
@@ -1024,10 +1120,10 @@ def build_assumptions_sheet(wb: Workbook, stock_id: str, data: dict,
         "說明：股利發放率會即時連動 PB Band 的預測 BVPS 公式，修改後儲存即可看到 PB Band 更新。"
         "回溯年數僅影響「產生報表當下」抓取的 PER/PBR 歷史資料範圍，修改後需重新執行程式才會生效（非即時連動）。"
         "發放率預設值 = 歷史各年度 (合計股利 / EPS) 之平均。")
-    n3.font = _f(size=8, color="7A0000"); n3.fill = FILL_CREAM
-    ws.row_dimensions[30].height = 26
+    n3.font = _f(size=8, color="7A0000"); n3.fill = FILL_CREAM; n3.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[30].height = 40
 
-    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["A"].width = 46
     for col in ["B", "C", "D", "E", "F", "G"]:
         ws.column_dimensions[col].width = 14
 
@@ -1093,9 +1189,10 @@ def _rb_na_cell(ws, row: int, key: str) -> None:
     c.alignment = ALIGN_C; c.border = BORDER_D
 
 
-def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict) -> None:
-    """The single source of truth for future revenue. Income Model's 26Q2F-26Q4F
-    and 2027F-2029F Revenue cells reference this sheet's row RB_FORECAST_REVENUE_ROW
+def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict,
+                              overlay: dict | None = None) -> None:
+    """The single source of truth for future revenue. Income Model's 26Q3F-27Q4F
+    and 2028F-2029F Revenue cells reference this sheet's row RB_FORECAST_REVENUE_ROW
     (see _qtr_fcast_formula / _ann_fcast_formula), and Assumptions' revenue rows
     become read-only links into it (see build_assumptions_sheet)."""
     ws = wb.create_sheet(REVENUE_BUILD_SHEET, index=wb.sheetnames.index(ASSUMPTIONS_SHEET) + 1)
@@ -1103,17 +1200,19 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
 
     rev_row = ir["Revenue"]
 
-    # Quarterly driver placeholder: most recent actual YoY (26Q1 vs 25Q1) — a
-    # brand-new model has no prior revenue assumption to preserve, so the most
-    # defensible neutral starting point is the latest real trend, not 0%.
-    q1_26 = data.get("Revenue", {}).get("26Q1")
-    q1_25 = data.get("Revenue", {}).get("25Q1")
-    qtr_growth_default = (q1_26 / q1_25 - 1) if (q1_26 and q1_25) else 0.0
+    # Quarterly driver placeholder: most recent actual YoY (latest reported quarter
+    # vs the same quarter a year earlier) — a brand-new model has no prior revenue
+    # assumption to preserve, so the most defensible neutral starting point is the
+    # latest real trend, not 0%.
+    q_latest = data.get("Revenue", {}).get(LAST_ACTUAL_KEY)
+    q_latest_py = data.get("Revenue", {}).get(f"{int(LAST_ACTUAL_KEY[:2]) - 1}{LAST_ACTUAL_KEY[2:]}")
+    qtr_growth_default = (q_latest / q_latest_py - 1) if (q_latest and q_latest_py) else 0.0
     # Annual driver placeholder: a flat, conservative long-term growth rate —
     # matches this model's long-standing default for out-year growth.
     ann_growth_default = 0.05
 
-    for r in range(1, 62):
+    overlay = overlay or {}
+    for r in range(1, OV_NOTE + 3):
         for ci in range(1, RB_LAST_COL + 2):
             ws.cell(r, ci).fill = FILL_CREAM
 
@@ -1126,7 +1225,7 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
     # ── A. Historical Revenue ─────────────────────────────────────────────
     _sec(ws, 3, "A. 歷史營收 Historical Revenue (引用 Income Model，非重複輸入)", end_col=RB_LAST_COL)
     _rb_write_header(ws, 4)
-    _rb_row_label(ws, RB_HIST_REVENUE_ROW, "營業收入淨額 Revenue (億元)", bold=True)
+    _rb_row_label(ws, RB_HIST_REVENUE_ROW, "營業收入淨額 Revenue (百萬元)", bold=True)
     _rb_row_label(ws, 6, "YoY 成長率 (實際)")
     for key in RB_HIST_KEYS:
         im_col = COL_LTR[key]
@@ -1141,6 +1240,7 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
         ("25Q4", f"'{INCOME_MODEL_SHEET}'!{COL_LTR['24Q4']}{rev_row}"),
         ("2025", f"{RB_COL_LTR['2024']}{RB_HIST_REVENUE_ROW}"),
         ("26Q1", f"{RB_COL_LTR['25Q1']}{RB_HIST_REVENUE_ROW}"),
+        ("26Q2", f"{RB_COL_LTR['25Q2']}{RB_HIST_REVENUE_ROW}"),
     ]
     _rb_dash_cell(ws, 6, "2024")
     for key, prior_ref in yoy_pairs:
@@ -1151,10 +1251,10 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
 
     # ── B. Revenue Driver Build ───────────────────────────────────────────
     ws.row_dimensions[7].height = 6
-    _sec(ws, 8, "B. 營收驅動因子預測 Revenue Driver Build — 黃色為可編輯假設", end_col=RB_LAST_COL)
+    _sec(ws, 8, "B. 營收驅動因子預測 Revenue Driver Build — 黃色為可編輯假設（本段只推既有業務；專案營收在 E 段疊加）", end_col=RB_LAST_COL)
     _rb_write_header(ws, 9)
 
-    for key in RB_HIST_KEYS + ["2026F"]:
+    for key in RB_NONDRIVER_KEYS:
         for row in (RB_VOLUME_ROW, RB_ASP_ROW, RB_MIX_ROW, RB_FX_ROW, RB_OVERRIDE_ROW):
             _rb_dash_cell(ws, row, key)
 
@@ -1165,10 +1265,13 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
     _rb_row_label(ws, RB_IMPLIED_GROWTH_ROW, "隱含營收成長率 Implied Revenue Growth YoY (Driver 加總試算)", bold=True)
     _rb_row_label(ws, RB_OVERRIDE_ROW, "人工覆蓋營收成長率 Manual Override YoY (留空 = 採用 Driver 推導)")
     _rb_row_label(ws, RB_APPLIED_GROWTH_ROW, "實際採用營收成長率 Applied Growth YoY (實際套用公式)", bold=True)
-    _rb_row_label(ws, RB_FORECAST_REVENUE_ROW, "營收預測 Forecast Revenue (億元)", bold=True)
+    _rb_row_label(ws, RB_FORECAST_REVENUE_ROW, "營收預測 Forecast Revenue (百萬元) = 既有業務 + 專案營收 (E 段)", bold=True)
 
     for key in RB_DRIVER_Q_KEYS + RB_DRIVER_A_KEYS:
-        vol_default = qtr_growth_default if key in RB_DRIVER_Q_KEYS else ann_growth_default
+        if key in RB_DRIVER_Q_KEYS:
+            vol_default = overlay.get("existing_growth_q", qtr_growth_default)
+        else:
+            vol_default = ann_growth_default
         _rb_data_cell(ws, RB_VOLUME_ROW, key, round(vol_default, 4), fmt=FMT_PCT, editable=True)
         _rb_data_cell(ws, RB_ASP_ROW, key, 0.0, fmt=FMT_PCT, editable=True)
         _rb_data_cell(ws, RB_MIX_ROW, key, 0.0, fmt=FMT_PCT, editable=True)
@@ -1184,19 +1287,30 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
 
     for key in RB_HIST_KEYS:
         _rb_dash_cell(ws, RB_FORECAST_REVENUE_ROW, key)
+    def _rev_ref(key: str) -> str:
+        """Revenue cell of `key`: reported quarters live in row 5, forecast ones in row 18."""
+        row = RB_HIST_REVENUE_ROW if key in RB_HIST_KEYS else RB_FORECAST_REVENUE_ROW
+        return f"{RB_COL_LTR[key]}{row}"
+
     for key in RB_DRIVER_Q_KEYS:
-        col, prior_col = RB_COL_LTR[key], RB_COL_LTR[RB_Q_PRIOR_KEY[key]]
+        col = RB_COL_LTR[key]
         _rb_data_cell(ws, RB_FORECAST_REVENUE_ROW, key,
-                      f'=IFERROR({prior_col}{RB_HIST_REVENUE_ROW}*(1+{col}{RB_APPLIED_GROWTH_ROW}),"")',
+                      f'=IFERROR({col}{OV_BASE}+{col}{OV_TOT_PROJ_REV},"")',
                       fmt=FMT_100M, fill=FILL_FCAST_QTR, bold=True)
-    q26_1, q26_2, q26_3, q26_4 = RB_COL_LTR["26Q1"], RB_COL_LTR["26Q2F"], RB_COL_LTR["26Q3F"], RB_COL_LTR["26Q4F"]
-    _rb_data_cell(ws, RB_FORECAST_REVENUE_ROW, "2026F",
-                  f'=IFERROR({q26_1}{RB_HIST_REVENUE_ROW}+{q26_2}{RB_FORECAST_REVENUE_ROW}+{q26_3}{RB_FORECAST_REVENUE_ROW}+{q26_4}{RB_FORECAST_REVENUE_ROW},"")',
-                  fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
+    # 2026F / 2027F = sum of their four quarters (no annual driver); the applied-growth
+    # row shows the resulting YoY for reference only (not an input).
+    for akey, prior_akey_ref in [("2026F", f"{RB_COL_LTR['2025']}{RB_HIST_REVENUE_ROW}"),
+                                 ("2027F", f"{RB_COL_LTR['2026F']}{RB_FORECAST_REVENUE_ROW}")]:
+        terms = "+".join(_rev_ref(k) for k in SUMMED_ANNUAL_QTRS[akey])
+        _rb_data_cell(ws, RB_FORECAST_REVENUE_ROW, akey, f'=IFERROR({terms},"")',
+                      fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
+        _rb_data_cell(ws, RB_APPLIED_GROWTH_ROW, akey,
+                      f'=IFERROR({RB_COL_LTR[akey]}{RB_FORECAST_REVENUE_ROW}/{prior_akey_ref}-1,"")',
+                      fmt=FMT_PCT, fill=_cfill("annual_fcast"))
     for key in RB_DRIVER_A_KEYS:
-        col, prior_col = RB_COL_LTR[key], RB_COL_LTR[RB_ANN_PRIOR_COL[key]]
+        col = RB_COL_LTR[key]
         _rb_data_cell(ws, RB_FORECAST_REVENUE_ROW, key,
-                      f'=IFERROR({prior_col}{RB_FORECAST_REVENUE_ROW}*(1+{col}{RB_APPLIED_GROWTH_ROW}),"")',
+                      f'=IFERROR({col}{OV_BASE}+{col}{OV_TOT_PROJ_REV},"")',
                       fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
 
     ws.row_dimensions[17].height = 6
@@ -1241,13 +1355,13 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
         for j, sub in enumerate(SEG_SUBROWS):
             row = name_row + 1 + j
             _rb_row_label(ws, row, sub)
-            for key in RB_HIST_KEYS + ["2026F"]:
+            for key in RB_NONDRIVER_KEYS:
                 _rb_na_cell(ws, row, key)
             for key in RB_DRIVER_Q_KEYS + RB_DRIVER_A_KEYS:
                 _rb_data_cell(ws, row, key, None, fmt=FMT_PCT, editable=True)
 
     _rb_row_label(ws, MIX_TOTAL_ROW, "產品結構佔比合計 Segment Mix Total (應 = 100% 或 N/A)", bold=True)
-    for key in RB_HIST_KEYS + ["2026F"]:
+    for key in RB_NONDRIVER_KEYS:
         _rb_na_cell(ws, MIX_TOTAL_ROW, key)
     for key in RB_DRIVER_Q_KEYS + RB_DRIVER_A_KEYS:
         col = RB_COL_LTR[key]
@@ -1256,7 +1370,7 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
         _rb_data_cell(ws, MIX_TOTAL_ROW, key, f, fmt=FMT_PCT, fill=FILL_FCAST_QTR, bold=True)
 
     _rb_row_label(ws, BLEND_MARGIN_ROW, "加權毛利率試算 Blended Gross Margin (Mix % x Segment 毛利率)", bold=True)
-    for key in RB_HIST_KEYS + ["2026F"]:
+    for key in RB_NONDRIVER_KEYS:
         _rb_na_cell(ws, BLEND_MARGIN_ROW, key)
     for key in RB_DRIVER_Q_KEYS + RB_DRIVER_A_KEYS:
         col = RB_COL_LTR[key]
@@ -1284,23 +1398,42 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
     _sec(ws, CHECK_HDR_ROW, "D. 模型檢查 Model Checks", end_col=RB_LAST_COL)
     CHECK_ROW0 = CHECK_HDR_ROW + 1
     CHECK_RESULT_COL = 5   # column E
-    q2, q3, q4, a26 = RB_COL_LTR["26Q2F"], RB_COL_LTR["26Q3F"], RB_COL_LTR["26Q4F"], RB_COL_LTR["2026F"]
-    m1, n1, o1 = RB_COL_LTR["2027F"], RB_COL_LTR["2028F"], RB_COL_LTR["2029F"]
-    im_m, im_o = COL_LTR["26Q2F"], COL_LTR["26Q4F"]
-    im_q, im_s = COL_LTR["2027F"], COL_LTR["2029F"]
+    # Forecast columns are not one contiguous block (the 2026F / 2027F annual columns
+    # sit in between), so every range check runs over these contiguous segments.
+    RB_SEGS = [("26Q3F", "26Q4F"), ("27Q1F", "27Q4F"), ("2028F", "2029F")]
+
+    def _rb_rng(row: int, seg: tuple) -> str:
+        return f"{RB_COL_LTR[seg[0]]}{row}:{RB_COL_LTR[seg[1]]}{row}"
+
+    def _im_rng(seg: tuple) -> str:
+        return f"'{INCOME_MODEL_SHEET}'!{COL_LTR[seg[0]]}{rev_row}:{COL_LTR[seg[1]]}{rev_row}"
+
+    def _sum_diff(akey: str) -> str:
+        terms = "+".join(_rev_ref(k) for k in SUMMED_ANNUAL_QTRS[akey])
+        return f"ABS({RB_COL_LTR[akey]}{RB_FORECAST_REVENUE_ROW}-({terms}))<0.01"
+
+    n_driver_cols = len(RB_DRIVER_Q_KEYS) + len(RB_DRIVER_A_KEYS)
+    mix_na = "+".join(f'COUNTIF({_rb_rng(MIX_TOTAL_ROW, sg)},"N/A")' for sg in RB_SEGS)
+    mix_bad = "+".join(
+        f'SUMPRODUCT(ISNUMBER({_rb_rng(MIX_TOTAL_ROW, sg)})*(ABS(N({_rb_rng(MIX_TOTAL_ROW, sg)})-1)>0.01))'
+        for sg in RB_SEGS)
+    link_terms = ",".join(
+        f"SUMPRODUCT(ABS(({_rb_rng(RB_FORECAST_REVENUE_ROW, sg)})-({_im_rng(sg)})))<0.01" for sg in RB_SEGS)
+    link_ann = ",".join(
+        f"ABS({RB_COL_LTR[k]}{RB_FORECAST_REVENUE_ROW}-'{INCOME_MODEL_SHEET}'!{COL_LTR[k]}{rev_row})<0.01"
+        for k in ("2026F", "2027F"))
+    err_terms = "+".join(
+        f"SUMPRODUCT(--ISERROR({_rb_rng(RB_IMPLIED_GROWTH_ROW, sg)}))" for sg in RB_SEGS)
 
     checks = [
-        (CHECK_ROW0 + 0, "1. 季度加總檢查 Quarterly Sum Check：2026F = 26Q1 + Q2F + Q3F + Q4F",
-             f'=IF(ABS({a26}{RB_FORECAST_REVENUE_ROW}-({q26_1}{RB_HIST_REVENUE_ROW}+{q2}{RB_FORECAST_REVENUE_ROW}+{q3}{RB_FORECAST_REVENUE_ROW}+{q4}{RB_FORECAST_REVENUE_ROW}))<0.01,"OK","ERROR")'),
+        (CHECK_ROW0 + 0, "1. 季度加總檢查 Quarterly Sum Check：2026F = 26Q1 + 26Q2 + Q3F + Q4F；2027F = 27Q1F ~ Q4F",
+             f'=IF(AND({_sum_diff("2026F")},{_sum_diff("2027F")}),"OK","ERROR")'),
         (CHECK_ROW0 + 1, "2. 產品結構佔比檢查 Segment Mix Check：合計 = 100% 或 N/A",
-             f'=IF(COUNTIF({q2}{MIX_TOTAL_ROW}:{q4}{MIX_TOTAL_ROW},"N/A")+COUNTIF({m1}{MIX_TOTAL_ROW}:{o1}{MIX_TOTAL_ROW},"N/A")=6,"N/A",'
-             f'IF(SUMPRODUCT(ISNUMBER({q2}{MIX_TOTAL_ROW}:{q4}{MIX_TOTAL_ROW})*(ABS(N({q2}{MIX_TOTAL_ROW}:{q4}{MIX_TOTAL_ROW})-1)>0.01))'
-             f'+SUMPRODUCT(ISNUMBER({m1}{MIX_TOTAL_ROW}:{o1}{MIX_TOTAL_ROW})*(ABS(N({m1}{MIX_TOTAL_ROW}:{o1}{MIX_TOTAL_ROW})-1)>0.01))>0,"ERROR","OK"))'),
+             f'=IF({mix_na}={n_driver_cols},"N/A",IF({mix_bad}>0,"ERROR","OK"))'),
         (CHECK_ROW0 + 2, "3. 營收連結檢查 Revenue Link Check：Revenue Build 與 Income Model 一致",
-             f'=IF(AND(SUMPRODUCT(ABS(({q2}{RB_FORECAST_REVENUE_ROW}:{q4}{RB_FORECAST_REVENUE_ROW})-(\'{INCOME_MODEL_SHEET}\'!{im_m}{rev_row}:{im_o}{rev_row})))<0.01,'
-             f'SUMPRODUCT(ABS(({m1}{RB_FORECAST_REVENUE_ROW}:{o1}{RB_FORECAST_REVENUE_ROW})-(\'{INCOME_MODEL_SHEET}\'!{im_q}{rev_row}:{im_s}{rev_row})))<0.01),"OK","ERROR")'),
+             f'=IF(AND({link_terms},{link_ann}),"OK","ERROR")'),
         (CHECK_ROW0 + 3, "4. 成長率計算檢查 Growth Calculation Check：Driver 公式無錯誤值",
-             f'=IF(SUMPRODUCT(--ISERROR({q2}{RB_IMPLIED_GROWTH_ROW}:{q4}{RB_IMPLIED_GROWTH_ROW}))+SUMPRODUCT(--ISERROR({m1}{RB_IMPLIED_GROWTH_ROW}:{o1}{RB_IMPLIED_GROWTH_ROW}))=0,"OK","ERROR")'),
+             f'=IF({err_terms}=0,"OK","ERROR")'),
     ]
     for row, label, formula in checks:
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=CHECK_RESULT_COL - 1)
@@ -1324,12 +1457,175 @@ def build_revenue_build_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict)
     ws.merge_cells(start_row=NOTE2_ROW, start_column=1, end_row=NOTE2_ROW, end_column=RB_LAST_COL)
     note2 = ws.cell(NOTE2_ROW, 1,
         "說明：Revenue Build 為 Income Model 未來營收的唯一來源 (Single Source of Truth)。"
-        "季度預測 = 去年同期營收 x (1+Applied Growth)；年度預測 = 前一年度營收 x (1+Applied Growth)。"
+        "季度預測 = 去年同期營收 x (1+Applied Growth)，2026 Q3 ~ 2027 Q4 逐季獨立預測，2026F／2027F = 四季加總（成長率列僅顯示結果，不是輸入）；"
+        "2028F 起年度預測 = 前一年度營收 x (1+Applied Growth)。"
         "季度出貨量成長率初始值 = 最近一期實際 YoY（近期實際趨勢作為中性起點）；"
         "年度出貨量成長率初始值 = 5%（保守長期成長假設，可自行調整）。"
         "平均售價／產品組合／匯率初始值均為 0%。如需調整，請直接修改本表黃色格子，或於「人工覆蓋」列強制指定成長率。")
     note2.font = _f(size=8, color="7A0000"); note2.fill = FILL_CREAM
     ws.row_dimensions[NOTE2_ROW].height = 26
+
+    # ── E. Project revenue overlay ─────────────────────────────────────────
+    # Known tenders / orders layered on top of the existing business. Existing business
+    # keeps using the Volume/ASP/Mix/FX growth drivers above (row 16 growth is applied to
+    # the existing-business row, not to total revenue). Each project has: win probability,
+    # gross margin, maintenance-fee eligibility and the revenue it books in each forecast
+    # column IF WON in full ("all or nothing"); probability-weighted revenue is what flows
+    # into total revenue. Total project revenue / gross profit feed Row 18 and the Income
+    # Model gross-profit formula (existing revenue x Assumptions margin + project GP).
+    projects = overlay.get("projects", [])
+    F_Q, F_A = RB_DRIVER_Q_KEYS, RB_DRIVER_A_KEYS
+    F_ALL = F_Q + RB_ANN_SUM_KEYS + F_A
+
+    _sec(ws, OV_SEC, "E. 專案營收疊加 Project Revenue Overlay — 已知標案／訂單疊加在既有業務之上（黃色為可編輯假設）", end_col=RB_LAST_COL)
+    _rb_write_header(ws, OV_HDR)
+
+    _rb_row_label(ws, OV_BASE, "既有業務營收 Existing Business Revenue (百萬元) = 去年同期 x (1+第 16 列成長率)", bold=True)
+    for key in F_Q:
+        col = RB_COL_LTR[key]
+        prior = RB_Q_PRIOR_KEY[key]
+        prior_ref = (f"{RB_COL_LTR[prior]}{RB_HIST_REVENUE_ROW}" if prior in RB_HIST_KEYS
+                     else f"{RB_COL_LTR[prior]}{OV_BASE}")
+        _rb_data_cell(ws, OV_BASE, key, f'=IFERROR({prior_ref}*(1+{col}{RB_APPLIED_GROWTH_ROW}),"")',
+                      fmt=FMT_100M, fill=FILL_FCAST_QTR, bold=True)
+    for akey in RB_ANN_SUM_KEYS:
+        parts = []
+        for k in SUMMED_ANNUAL_QTRS[akey]:
+            parts.append(f"{RB_COL_LTR[k]}{RB_HIST_REVENUE_ROW}" if k in RB_HIST_KEYS else f"{RB_COL_LTR[k]}{OV_BASE}")
+        _rb_data_cell(ws, OV_BASE, akey, f'=IFERROR({"+".join(parts)},"")',
+                      fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
+    for key in F_A:
+        col, prior_col = RB_COL_LTR[key], RB_COL_LTR[RB_ANN_PRIOR_COL[key]]
+        _rb_data_cell(ws, OV_BASE, key, f'=IFERROR({prior_col}{OV_BASE}*(1+{col}{RB_APPLIED_GROWTH_ROW}),"")',
+                      fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
+
+    def _scalar(row: int, label: str, value, fmt: str) -> None:
+        _rb_row_label(ws, row, label)
+        c = ws.cell(row, 2, value)
+        c.number_format = fmt; c.alignment = ALIGN_R; c.font = _f(size=9)
+        c.fill = FILL_INPUT; c.border = BORDER_D
+
+    adj_row, gm_row, flag_row, bear_row = {}, {}, {}, {}
+    for i in range(OV_N):
+        pj = projects[i] if i < len(projects) else {}
+        r0 = OV_P0 + OV_BLK * i
+        name_r, prob_r, gmr, flag_r, bear_r, amt_r, adj_r = r0, r0 + 1, r0 + 2, r0 + 3, r0 + 4, r0 + 5, r0 + 6
+        adj_row[i], gm_row[i], flag_row[i], bear_row[i] = adj_r, gmr, flag_r, bear_r
+        _rb_row_label(ws, name_r, f"專案 {i + 1} 名稱與假設依據", bold=True)
+        ws.merge_cells(start_row=name_r, start_column=2, end_row=name_r, end_column=RB_LAST_COL)
+        nc = ws.cell(name_r, 2, (pj.get("name", "") + ("｜" + pj["note"] if pj.get("note") else "")) or None)
+        nc.font = _f(size=9, bold=True); nc.fill = FILL_INPUT; nc.alignment = ALIGN_L_WRAP; nc.border = BORDER_D
+        if pj.get("note"):
+            ws.row_dimensions[name_r].height = max(28, 13 * math.ceil(len(nc.value) / 95))
+        _scalar(prob_r, "　得標機率（0～100%，於 B 欄輸入）", pj.get("prob", 1.0) if pj else None, FMT_PCT)
+        _scalar(gmr, "　專案毛利率（於 B 欄輸入）", pj.get("gm"), FMT_PCT)
+        _scalar(flag_r, "　適用維護費（1 = 是、0 = 否，於 B 欄輸入）", pj.get("maint", 0) if pj else None, FMT_YEAR)
+        _scalar(bear_r, "　Bear 情境歸零（1 = 標案，全沒得標時為零；0 = 否，於 B 欄輸入）", pj.get("bear", 0) if pj else None, FMT_YEAR)
+        _rb_row_label(ws, amt_r, "　得標後認列營收 Revenue if won (百萬元，可輸入公式)")
+        _rb_row_label(ws, adj_r, "　認列營收 x 得標機率 (百萬元)", bold=True)
+        amounts = pj.get("amounts", {})
+        for key in F_Q + F_A:
+            _rb_data_cell(ws, amt_r, key, amounts.get(key), fmt=FMT_100M, editable=True)
+        for akey in RB_ANN_SUM_KEYS:
+            qs = [k for k in SUMMED_ANNUAL_QTRS[akey] if k in F_Q]
+            _rb_data_cell(ws, amt_r, akey, "=" + "+".join(f"{RB_COL_LTR[k]}{amt_r}" for k in qs),
+                          fmt=FMT_100M, fill=_cfill("annual_fcast"))
+        for key in F_ALL:
+            col = RB_COL_LTR[key]
+            _rb_data_cell(ws, adj_r, key, f'=IFERROR(N({col}{amt_r})*N($B${prob_r}),0)',
+                          fmt=FMT_100M, fill=_cfill("annual_fcast") if key not in F_Q else FILL_FCAST_QTR, bold=True)
+
+    # Maintenance fee: rate x cumulative (probability-weighted) revenue of eligible projects
+    # booked in calendar years BEFORE the column's year; quarterly columns get rate/4.
+    _scalar(OV_MAINT_RATE, "維護費率 Maintenance Fee (% of 累計已認列專案營收／年，於 B 欄輸入)", overlay.get("maint_rate"), FMT_PCT)
+    _scalar(OV_MAINT_GM, "維護費毛利率（於 B 欄輸入）", overlay.get("maint_gm"), FMT_PCT)
+    _rb_row_label(ws, OV_MAINT_REV, "維護費營收 Maintenance Revenue (百萬元) = 費率 x 前幾年累計適用專案營收", bold=True)
+    _rb_row_label(ws, OV_MAINT_GP, "維護費毛利 Maintenance Gross Profit (百萬元)")
+    prior_years = {"26Q3F": [], "26Q4F": [], "27Q1F": ["2026F"], "27Q2F": ["2026F"], "27Q3F": ["2026F"],
+                   "27Q4F": ["2026F"], "2028F": ["2026F", "2027F"], "2029F": ["2026F", "2027F", "2028F"]}
+    for key in F_Q + F_A:
+        col = RB_COL_LTR[key]
+        yrs = prior_years[key]
+        if yrs:
+            cum = "+".join(
+                f"N($B${flag_row[i]})*(" + "+".join(f"N({RB_COL_LTR[y]}{adj_row[i]})" for y in yrs) + ")"
+                for i in range(OV_N))
+            div = "/4" if key in F_Q else ""
+            f = f'=IFERROR(N($B${OV_MAINT_RATE})*({cum}){div},0)'
+        else:
+            f = 0
+        _rb_data_cell(ws, OV_MAINT_REV, key, f, fmt=FMT_100M,
+                      fill=FILL_FCAST_QTR if key in F_Q else _cfill("annual_fcast"), bold=True)
+    for akey in RB_ANN_SUM_KEYS:
+        qs = [RB_COL_LTR[k] for k in SUMMED_ANNUAL_QTRS[akey] if k in F_Q]
+        _rb_data_cell(ws, OV_MAINT_REV, akey, "=" + "+".join(f"{c}{OV_MAINT_REV}" for c in qs),
+                      fmt=FMT_100M, fill=_cfill("annual_fcast"), bold=True)
+    ws.row_dimensions[OV_M0 + 4].height = 6
+
+    _rb_row_label(ws, OV_TOT_PROJ_REV, "專案營收合計 Total Project Revenue (百萬元，含維護費)", bold=True)
+    _rb_row_label(ws, OV_TOT_PROJ_GP, "專案毛利合計 Total Project Gross Profit (百萬元)", bold=True)
+    _rb_row_label(ws, OV_TOT_REV, "總營收 Total Revenue (百萬元) = 既有業務 + 專案（與第 18 列一致）", bold=True)
+    for key in F_ALL:
+        col = RB_COL_LTR[key]
+        fill = FILL_FCAST_QTR if key in F_Q else _cfill("annual_fcast")
+        rev_terms = "+".join(f"{col}{adj_row[i]}" for i in range(OV_N)) + f"+{col}{OV_MAINT_REV}"
+        gp_terms = "+".join(f"{col}{adj_row[i]}*N($B${gm_row[i]})" for i in range(OV_N))
+        _rb_data_cell(ws, OV_TOT_PROJ_REV, key, f'=IFERROR({rev_terms},0)', fmt=FMT_100M, fill=fill, bold=True)
+        if key in RB_ANN_SUM_KEYS:
+            gp_f = f'=IFERROR({gp_terms}+{col}{OV_MAINT_GP},0)'
+            mgp = "=" + "+".join(f"{RB_COL_LTR[k]}{OV_MAINT_GP}" for k in SUMMED_ANNUAL_QTRS[key] if k in F_Q)
+            _rb_data_cell(ws, OV_MAINT_GP, key, mgp, fmt=FMT_100M, fill=fill)
+        else:
+            _rb_data_cell(ws, OV_MAINT_GP, key, f'=IFERROR({col}{OV_MAINT_REV}*N($B${OV_MAINT_GM}),0)',
+                          fmt=FMT_100M, fill=fill)
+            gp_f = f'=IFERROR({gp_terms}+{col}{OV_MAINT_GP},0)'
+        _rb_data_cell(ws, OV_TOT_PROJ_GP, key, gp_f, fmt=FMT_100M, fill=fill, bold=True)
+        _rb_data_cell(ws, OV_TOT_REV, key, f'=IFERROR({col}{OV_BASE}+{col}{OV_TOT_PROJ_REV},"")',
+                      fmt=FMT_100M, fill=fill, bold=True)
+    # Bear scenario rows (no tender won): same maintenance logic, zeroing flagged projects.
+    _rb_row_label(ws, OV_BEAR_MAINT, "Bear 情境維護費營收（歸零專案不計）(百萬元)")
+    _rb_row_label(ws, OV_BEAR_PROJ_REV, "Bear 情境專案營收合計 (百萬元)", bold=True)
+    _rb_row_label(ws, OV_BEAR_GP, "Bear 情境專案毛利合計 (百萬元)", bold=True)
+    _rb_row_label(ws, OV_BEAR_TOT, "Bear 情境總營收 (百萬元) = 既有業務 + Bear 專案", bold=True)
+    for key in F_Q + F_A:
+        col = RB_COL_LTR[key]
+        yrs = prior_years[key]
+        if yrs:
+            cum = "+".join(
+                f"N($B${flag_row[i]})*(1-N($B${bear_row[i]}))*(" + "+".join(f"N({RB_COL_LTR[y]}{adj_row[i]})" for y in yrs) + ")"
+                for i in range(OV_N))
+            div = "/4" if key in F_Q else ""
+            f = f'=IFERROR(N($B${OV_MAINT_RATE})*({cum}){div},0)'
+        else:
+            f = 0
+        _rb_data_cell(ws, OV_BEAR_MAINT, key, f, fmt=FMT_100M,
+                      fill=FILL_FCAST_QTR if key in F_Q else _cfill("annual_fcast"))
+    for akey in RB_ANN_SUM_KEYS:
+        qs = [RB_COL_LTR[k] for k in SUMMED_ANNUAL_QTRS[akey] if k in F_Q]
+        _rb_data_cell(ws, OV_BEAR_MAINT, akey, "=" + "+".join(f"{c}{OV_BEAR_MAINT}" for c in qs),
+                      fmt=FMT_100M, fill=_cfill("annual_fcast"))
+    for key in F_ALL:
+        col = RB_COL_LTR[key]
+        fill = FILL_FCAST_QTR if key in F_Q else _cfill("annual_fcast")
+        keep = [f"{col}{adj_row[i]}*(1-N($B${bear_row[i]}))" for i in range(OV_N)]
+        _rb_data_cell(ws, OV_BEAR_PROJ_REV, key, f'=IFERROR({"+".join(keep)}+{col}{OV_BEAR_MAINT},0)',
+                      fmt=FMT_100M, fill=fill, bold=True)
+        gp_keep = [f"{col}{adj_row[i]}*(1-N($B${bear_row[i]}))*N($B${gm_row[i]})" for i in range(OV_N)]
+        _rb_data_cell(ws, OV_BEAR_GP, key, f'=IFERROR({"+".join(gp_keep)}+{col}{OV_BEAR_MAINT}*N($B${OV_MAINT_GM}),0)',
+                      fmt=FMT_100M, fill=fill, bold=True)
+        _rb_data_cell(ws, OV_BEAR_TOT, key, f'=IFERROR({col}{OV_BASE}+{col}{OV_BEAR_PROJ_REV},"")',
+                      fmt=FMT_100M, fill=fill, bold=True)
+    ws.row_dimensions[OV_M0 + 8].height = 6
+    ws.row_dimensions[OV_M0 + 13].height = 6
+    ws.merge_cells(start_row=OV_NOTE, start_column=1, end_row=OV_NOTE, end_column=RB_LAST_COL)
+    ov_note = ws.cell(OV_NOTE, 1,
+        "說明：專案營收「全有全無」，得標後全額認列，未得標則該專案為零；得標機率預設 100%，需要打折時改 B 欄。"
+        "「Bear 歸零」標 1 的專案，在情境分析的 Bear（全沒得標）情境中營收與維護費皆為零。"
+        "2026F／2027F 欄為季度加總，不可直接輸入。維護費只計「前幾個曆年」已認列的適用專案營收（當年新認列的不計），"
+        "季度欄為年費率 ÷ 4。專案毛利合計加上既有業務營收 x Assumptions 毛利率 = Income Model 預測毛利；"
+        "營業費用率仍套用在總營收。未設定專案時本段為空，模型與舊版相同。")
+    ov_note.font = _f(size=8, color="7A0000"); ov_note.fill = FILL_CREAM
+    ws.row_dimensions[OV_NOTE].height = 40
 
     ws.column_dimensions["A"].width = 42
     for _, key, _c in RB_COLUMNS:
@@ -1363,7 +1659,7 @@ def build_dashboard_sheet(wb: Workbook, stock_id: str, layout: dict) -> None:
 
     # ── Title ────────────────────────────────────────────────────────────────
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=18)
-    t = ws.cell(1, 1, f"{stock_id}  Financial Dashboard   單位：億元")
+    t = ws.cell(1, 1, f"{stock_id}  Financial Dashboard   單位：百萬元")
     t.font = _f(bold=True, size=13, color="7A0000"); t.alignment = ALIGN_C
     ws.row_dimensions[1].height = 24
     ws.row_dimensions[2].height = 5
@@ -1451,7 +1747,7 @@ def build_dashboard_sheet(wb: Workbook, stock_id: str, layout: dict) -> None:
 
     # 5 key summary rows (rows 5-9)
     FCST_ROWS = [
-        ("Revenue (億元)", "Revenue",     FMT_100M),
+        ("Revenue (百萬元)", "Revenue",     FMT_100M),
         ("Revenue YoY",    "Revenue YoY", FMT_PCT),
         ("Gross Margin",   "Gross Margin",FMT_PCT),
         ("Op. Margin",     "Op. Margin",  FMT_PCT),
@@ -1523,13 +1819,13 @@ def build_dashboard_sheet(wb: Workbook, stock_id: str, layout: dict) -> None:
         return ch
 
     # Row 1 — Revenue Trend (left) | Gross Profit Trend (right)
-    ws.add_chart(_lc("Revenue Trend (億元)", "#,##0",
+    ws.add_chart(_lc("Revenue Trend (百萬元)", "#,##0",
                      [("Revenue", PALETTE[0])]), ANCHORS[0][0])
-    ws.add_chart(_lc("Gross Profit Trend (億元)", "#,##0",
+    ws.add_chart(_lc("Gross Profit Trend (百萬元)", "#,##0",
                      [("Gross Profit", PALETTE[0])]), ANCHORS[0][1])
 
     # Row 2 — Operating Income Trend (left) | EPS Trend (right)
-    ws.add_chart(_lc("Operating Income Trend (億元)", "#,##0",
+    ws.add_chart(_lc("Operating Income Trend (百萬元)", "#,##0",
                      [("Operating Income", PALETTE[0])]), ANCHORS[1][0])
     ws.add_chart(_lc("EPS Trend (元)", "0.00",
                      [("EPS", PALETTE[0])]), ANCHORS[1][1])
@@ -1540,7 +1836,7 @@ def build_dashboard_sheet(wb: Workbook, stock_id: str, layout: dict) -> None:
         ("Op. Margin",   PALETTE[1]),
         ("Net Margin",   PALETTE[2]),
     ]), ANCHORS[2][0])
-    ws.add_chart(_bc("P&L Comparison (億元)", [
+    ws.add_chart(_bc("P&L Comparison (百萬元)", [
         ("Revenue",          PALETTE[0]),
         ("Gross Profit",     PALETTE[1]),
         ("Operating Income", PALETTE[2]),
@@ -1585,14 +1881,15 @@ def _band_quarter_header(ws, row: int, keys: list[str]) -> None:
 
 
 def build_pe_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, price_df: pd.DataFrame | None,
-                         per_df: pd.DataFrame | None, band_lookback_years: int) -> None:
+                         per_df: pd.DataFrame | None, band_lookback_years: int,
+                         overlay: dict | None = None) -> None:
     ws = wb.create_sheet(PE_BAND_SHEET)
     ws.sheet_properties.tabColor = "7A0000"
     keys = BAND_QTR_KEYS
     n = len(keys)
     last_col = 1 + n
 
-    for r in range(1, 40):
+    for r in range(1, 62):
         for ci in range(1, last_col + 2):
             ws.cell(r, ci).fill = FILL_CREAM
 
@@ -1624,7 +1921,7 @@ def build_pe_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, price
         nc.font = _f(size=9, color="7A0000"); nc.alignment = ALIGN_L; nc.border = BORDER_D
     note = ws.cell(8, 1, "平均值/標準差為黃色可編輯格 — 可手動覆寫；重新執行程式會以最新資料回填預設值。"
                          "已排除偏離中位數 3 倍以上的極端值（例如單季獲利驟降造成的異常本益比）。"
-                         "NTM EPS 於超出季度預測範圍時（如 27Q1F），以次一年度 EPS 預測 ÷4 作為 proxy，待建立完整季度預測後可替換。")
+                         "NTM EPS 於超出季度預測範圍時（27Q1F 起不足四季），以 2028F 年度 EPS 預測 ÷4 作為 proxy，待建立完整季度預測後可替換。")
     note.font = _f(size=8, color="666666"); note.fill = FILL_CREAM
     ws.row_dimensions[8].height = 26
 
@@ -1638,7 +1935,7 @@ def build_pe_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, price
     _band_row_label(ws, IMPPE_R, "隱含 Forward P/E (x)", bold=True)
     # A quarter counts as "reported" for price/multiple purposes based on whether we
     # can actually find a trading-day close for it — NOT on the model's static
-    # 26Q2F/26Q3F/26Q4F template labels, which stay "forecast" even once FinMind has
+    # forecast-quarter template labels, which stay "forecast" even once FinMind has
     # real data for that quarter (see _ntm_formula for the same issue on the EPS side).
     price_found: set[str] = set()
     for i, key in enumerate(keys):
@@ -1700,7 +1997,7 @@ def build_pe_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, price
     for j, lbl in enumerate(rows_lbl):
         _band_row_label(ws, READ_HDR + 1 + j, lbl)
     R_PX, R_DT, R_PE, R_DEV, R_READ = (READ_HDR + 1, READ_HDR + 2, READ_HDR + 3, READ_HDR + 4, READ_HDR + 5)
-    cur_ntm_col = get_column_letter(2 + keys.index("26Q1"))
+    cur_ntm_col = get_column_letter(2 + keys.index(LAST_ACTUAL_KEY))
     if latest:
         px, d = latest
         c = ws.cell(R_PX, 2, round(px, 2)); c.number_format = FMT_PRICE
@@ -1723,7 +2020,40 @@ def build_pe_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, price
         ws.cell(R_PX, 2, "無法取得 FinMind 股價資料").font = _f(size=9, color="7A0000")
 
     # ── Chart ──────────────────────────────────────────────────────────────────
-    CHART_ROW = R_READ + 3
+    # ── Target price: Target P/E x NTM EPS at the 6M / 12M horizon ─────────────
+    TP_KEYS = [("6 個月", "27Q1F"), ("12 個月", "27Q3F")]        # quarter-ends ~6 / ~12 months after 26Q3
+    R_TPS = R_READ + 2
+    _sec(ws, R_TPS, "目標價 Target Price = Target P/E x 該時點 NTM EPS（Target P/E 為研究員指定，黃色可改）", end_col=last_col)
+    hdr = ws.cell(R_TPS + 1, 1, "項目")
+    hdr.font = _f(bold=True, size=9, color="FFFFFF"); hdr.fill = FILL_WINE; hdr.alignment = ALIGN_C; hdr.border = BORDER_D
+    for j, (lbl, _k) in enumerate(TP_KEYS):
+        c = ws.cell(R_TPS + 1, 2 + j, lbl)
+        c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE; c.alignment = ALIGN_C; c.border = BORDER_D
+    R_TPE, R_TPQ, R_TPN, R_TPP, R_TPU = R_TPS + 2, R_TPS + 3, R_TPS + 4, R_TPS + 5, R_TPS + 6
+    for row, lbl, bold in [(R_TPE, "Target P/E (x)", False), (R_TPQ, "對應時點（季底）", False),
+                           (R_TPN, "該時點 NTM EPS (元)", False), (R_TPP, "目標價 (元)", True),
+                           (R_TPU, "潛在漲跌幅 vs 最新收盤價", True)]:
+        _band_row_label(ws, row, lbl, bold=bold)
+    tpe = (overlay or {}).get("target_pe")
+    for j, (_lbl, k) in enumerate(TP_KEYS):
+        col = get_column_letter(2 + j)
+        ntm_col = get_column_letter(2 + keys.index(k))
+        vals = [
+            (R_TPE, tpe if j == 0 else f"=$B${R_TPE}", FMT_MULT, FILL_INPUT, False),
+            (R_TPQ, COL_HDR[k], "@", FILL_CREAM, False),
+            (R_TPN, f"={ntm_col}{NTM_R}", FMT_EPS, FILL_CREAM, False),
+            (R_TPP, f'=IFERROR({col}{R_TPE}*{col}{R_TPN},"")', FMT_PRICE, FILL_FCAST_QTR, True),
+            (R_TPU, f'=IFERROR({col}{R_TPP}/$B${R_PX}-1,"")', FMT_PCT, FILL_CREAM, True),
+        ]
+        for row, v, fmt, fill, bold in vals:
+            c = ws.cell(row, 2 + j, v)
+            c.number_format = fmt; c.alignment = ALIGN_R; c.font = _f(bold=bold, size=9)
+            c.fill = fill; c.border = BORDER_HL if bold else BORDER_D
+    tn = ws.cell(R_TPU + 1, 1, "說明：NTM EPS 超出季度預測範圍的部分（2028 年）以全年 EPS ÷ 4 代入；EPS 已含全部標案得標的假設，見 Revenue Build E 段。"
+                              "12 個月欄的 Target P/E 預設等於 6 個月欄，可自行覆蓋。")
+    tn.font = _f(size=8, color="7A0000"); tn.fill = FILL_CREAM
+    ws.row_dimensions[R_TPU + 1].height = 13
+    CHART_ROW = R_TPU + 3
     cats_f = f"'{ws.title}'!$B$17:${get_column_letter(1 + n)}$17"
     ch = LineChart()
     band_colors = {
@@ -1759,7 +2089,7 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
                          band_lookback_years: int) -> None:
     ws = wb.create_sheet(PB_BAND_SHEET)
     ws.sheet_properties.tabColor = "7A0000"
-    keys = BAND_QTR_KEYS
+    keys = BAND_QTR_KEYS + [PB_EXTRA_YEAR_KEY]     # + year-end 2028: BVPS rolled with full-year 2028 EPS
     n = len(keys)
     last_col = 1 + n
 
@@ -1807,7 +2137,7 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
     _band_row_label(ws, PRICE_R, "季底收盤價 (元)")
     _band_row_label(ws, IMPPB_R, "隱含 Forward P/B (x)", bold=True)
     payout_ref = f"'{ASSUMPTIONS_SHEET}'!$B${A_PAYOUT_R}"
-    # Same staleness issue as PE Band's NTM EPS: Income Model's 26Q2F/26Q3F/26Q4F
+    # Same staleness issue as PE Band's NTM EPS: Income Model's forecast-quarter columns
     # stay labelled "forecast" even after FinMind has real reported balance-sheet
     # data for that quarter. Check real data availability directly rather than the
     # model's static historical/forecast key split.
@@ -1821,7 +2151,7 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
         bvps_c.number_format = FMT_PRICE; bvps_c.alignment = ALIGN_R
         bvps_c.font = _f(bold=True, size=9); bvps_c.fill = fill; bvps_c.border = BORDER_HL
         eq = bs_extra.get("BS_Equity", {}).get(plain_key)
-        cap_raw = data.get("OrdinaryShare", {}).get(plain_key)   # raw NT$ — bs_extra values are already 億元
+        cap_raw = data.get("OrdinaryShare", {}).get(plain_key)   # raw NT$ — bs_extra values are already 百萬元
         if eq is not None and cap_raw:
             bvps_c.value = round(eq / (cap_raw / UNIT) * 10, 2)
         elif i > 0:
@@ -1834,7 +2164,7 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
         price_cell = ws.cell(PRICE_R, 2 + i)
         price_cell.number_format = FMT_PRICE; price_cell.alignment = ALIGN_R
         price_cell.font = _f(size=9); price_cell.fill = fill; price_cell.border = BORDER_D
-        px = _price_on_or_before(price_df, _quarter_end_date(key))
+        px = None if key == PB_EXTRA_YEAR_KEY else _price_on_or_before(price_df, _quarter_end_date(key))
         if px is not None:
             price_cell.value = round(px, 2)
             price_found.add(key)
@@ -1846,7 +2176,8 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
             pb_cell.value = f'=IFERROR({col}{PRICE_R}/{col}{BVPS_R},"")'
 
     note2 = ws.cell(15, 1, "說明：預測季度 BVPS = 前一季 BVPS + 該季 EPS 預測 × (1 − 股利發放率假設，見 Assumptions)。"
-                           "此為簡化的保留盈餘滾動法，非完整資產負債表預測（本模型未預測其他權益項目變動）。")
+                           "此為簡化的保留盈餘滾動法，非完整資產負債表預測（本模型未預測其他權益項目變動）。"
+                           "最右側 2028(F) 欄為 2028 年底：27Q4 BVPS 加上 2028 全年 EPS x (1 − 股利發放率)，無季底股價。")
     note2.font = _f(size=8, color="666666"); note2.fill = FILL_CREAM
     ws.row_dimensions[15].height = 13
 
@@ -1888,7 +2219,7 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
     for j, lbl in enumerate(rows_lbl):
         _band_row_label(ws, READ_HDR + 1 + j, lbl)
     R_PX, R_DT, R_PB, R_DEV, R_READ = (READ_HDR + 1, READ_HDR + 2, READ_HDR + 3, READ_HDR + 4, READ_HDR + 5)
-    cur_bvps_col = get_column_letter(2 + keys.index("26Q1"))
+    cur_bvps_col = get_column_letter(2 + keys.index(LAST_ACTUAL_KEY))
     if latest:
         px, d = latest
         c = ws.cell(R_PX, 2, round(px, 2)); c.number_format = FMT_PRICE
@@ -1942,212 +2273,308 @@ def build_pb_band_sheet(wb: Workbook, stock_id: str, ir: dict, data: dict, bs_ex
         ws.column_dimensions[get_column_letter(2 + i)].width = 11
 
 # ── Build Scenario Analysis ─────────────────────────────────────────────────
-def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None:
-    """Bull / Base / Bear scenarios. Base is a live read-only link to the single
-    source of truth (Revenue Build for 2027F-2029F growth, Income Model's own
-    2026F column, Assumptions for margin/opex/tax/capital) — it is never a second
-    copy of an assumption. Bull/Bear are expressed as an editable DELTA vs Base
-    (not an absolute override), so the actual Bull/Bear rate is itself a formula
-    (Base + delta) and needs no Python-side recomputation of Base's value.
-    Operating expense ratio, non-operating income, tax rate and capital are held
-    the SAME across all three scenarios (only revenue growth and gross margin are
-    varied) — this is the standard simplification for a quick scenario table."""
+def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict, overlay: dict | None = None) -> None:
+    """Bull / Base / Bear / Custom scenarios, all in one A:E column block (years across).
+
+    Base = live link to Income Model's own annual columns (never a second copy of an
+    assumption). Bull = Base revenue growth / gross margin plus an editable delta.
+    Bear = "no tender won": existing-business revenue plus only the project lines that are
+    not flagged as tenders (Revenue Build section E, rows OV_BEAR_*), no maintenance fees
+    on the zeroed projects, existing-business margin. Custom = the researcher's own
+    absolute inputs (default: linked to Base). Opex ratio, non-operating income, tax rate,
+    share capital and minority interest are taken from Income Model for every scenario."""
     ws = wb.create_sheet(SCENARIO_SHEET)
     ws.sheet_properties.tabColor = "7A0000"
+    overlay = overlay or {}
 
     SC_COL = {"2026F": "B", "2027F": "C", "2028F": "D", "2029F": "E"}
     LAST_COL = 5
+    YRS = SCENARIO_YEARS
+    IM, RB = INCOME_MODEL_SHEET, REVENUE_BUILD_SHEET
 
-    for r in range(1, 50):
-        for ci in range(1, LAST_COL + 2):
+    for r in range(1, 135):
+        for ci in range(1, 18):
             ws.cell(r, ci).fill = FILL_CREAM
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=LAST_COL)
-    t = ws.cell(1, 1, f"{stock_id}  情境分析 Scenario Analysis (Bull / Base / Bear)")
+    t = ws.cell(1, 1, f"{stock_id}  情境分析 Scenario Analysis   單位：新台幣百萬元（EPS、股價為元）")
     t.font = _f(bold=True, size=12, color="7A0000"); t.alignment = ALIGN_C
     ws.row_dimensions[1].height = 22
     ws.row_dimensions[2].height = 6
+
+    def _sec5(row: int, text: str) -> None:
+        _sec(ws, row, text, end_col=LAST_COL)
 
     def _hdr(row: int) -> None:
         h = ws.cell(row, 1, "項目 Item")
         h.font = _f(bold=True, size=9, color="FFFFFF"); h.fill = FILL_WINE
         h.alignment = ALIGN_C; h.border = BORDER_D
-        for yr, col in SC_COL.items():
-            c = ws.cell(row, {"B": 2, "C": 3, "D": 4, "E": 5}[col], yr.replace("F", "(F)"))
+        for yr in YRS:
+            c = ws[f"{SC_COL[yr]}{row}"]
+            c.value = yr.replace("F", "(F)")
             c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE
             c.alignment = ALIGN_C; c.border = BORDER_D
         ws.row_dimensions[row].height = 16
 
     def _cell(row: int, yr: str, value=None, fmt: str = FMT_PCT, fill=None, bold: bool = False, editable: bool = False):
-        col = {"B": 2, "C": 3, "D": 4, "E": 5}[SC_COL[yr]]
-        c = ws.cell(row, col, value)
+        c = ws[f"{SC_COL[yr]}{row}"]
+        c.value = value
         c.number_format = fmt; c.alignment = ALIGN_R; c.font = _f(bold=bold, size=9)
         c.fill = fill if fill is not None else (FILL_INPUT if editable else FILL_CREAM)
         c.border = BORDER_HL if bold else BORDER_D
         return c
 
-    rev_row, gp_row = ir["Revenue"], ir["GrossProfit"]
-    opex_row, oi_row = ir["OperatingExpenses"], ir["OperatingIncome"]
-    nonop_row, pretax_row = ir["TotalNonoperatingIncomeAndExpense"], ir["PreTaxIncome"]
-    tax_row, ni_row, cap_row = ir["TAX"], ir["EquityAttributableToOwnersOfParent"], ir["OrdinaryShare"]
-    IM = INCOME_MODEL_SHEET
-    c2026 = COL_LTR["2026F"]
+    def _text_row(row: int, label: str, text: str, editable: bool = False, chars_per_line: int = 26) -> None:
+        _band_row_label(ws, row, label, bold=True)
+        ws.cell(row, 1).alignment = ALIGN_L_WRAP
+        ws.cell(row, 1).border = BORDER_D
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=LAST_COL)
+        for ci in range(2, LAST_COL + 1):
+            cc = ws.cell(row, ci)
+            cc.fill = FILL_INPUT if editable else FILL_CREAM
+            cc.border = BORDER_D
+        c = ws.cell(row, 2, text or None)
+        c.font = _f(size=9); c.alignment = ALIGN_L_WRAP
+        ws.row_dimensions[row].height = max(30, 15 * math.ceil(len(text or "") / chars_per_line) + 8)
 
-    BASE_GROWTH = {
-        "2026F": f"'{IM}'!{c2026}{rev_row}/'{IM}'!{COL_LTR['2025']}{rev_row}-1",
-        "2027F": f"'{REVENUE_BUILD_SHEET}'!{RB_COL_LTR['2027F']}{RB_APPLIED_GROWTH_ROW}",
-        "2028F": f"'{REVENUE_BUILD_SHEET}'!{RB_COL_LTR['2028F']}{RB_APPLIED_GROWTH_ROW}",
-        "2029F": f"'{REVENUE_BUILD_SHEET}'!{RB_COL_LTR['2029F']}{RB_APPLIED_GROWTH_ROW}",
-    }
-    BASE_MARGIN = {
-        "2026F": f"'{IM}'!{c2026}{gp_row}/'{IM}'!{c2026}{rev_row}",
-        "2027F": f"'{ASSUMPTIONS_SHEET}'!$B${A_ANN_GM_R}",
-        "2028F": f"'{ASSUMPTIONS_SHEET}'!$C${A_ANN_GM_R}",
-        "2029F": f"'{ASSUMPTIONS_SHEET}'!$D${A_ANN_GM_R}",
-    }
-    OPEX_REF = {
-        "2026F": f"'{IM}'!{c2026}{opex_row}/'{IM}'!{c2026}{rev_row}",
-        "2027F": f"'{ASSUMPTIONS_SHEET}'!$B${A_ANN_OPEX_R}",
-        "2028F": f"'{ASSUMPTIONS_SHEET}'!$C${A_ANN_OPEX_R}",
-        "2029F": f"'{ASSUMPTIONS_SHEET}'!$D${A_ANN_OPEX_R}",
-    }
-    NONOP_REF = {
-        "2026F": f"'{IM}'!{c2026}{nonop_row}",
-        "2027F": f"'{ASSUMPTIONS_SHEET}'!$B${A_ANN_NONOP_R}",
-        "2028F": f"'{ASSUMPTIONS_SHEET}'!$C${A_ANN_NONOP_R}",
-        "2029F": f"'{ASSUMPTIONS_SHEET}'!$D${A_ANN_NONOP_R}",
-    }
-    TAX_REF = {
-        "2026F": f"'{IM}'!{c2026}{tax_row}/'{IM}'!{c2026}{pretax_row}",
-        "2027F": f"'{ASSUMPTIONS_SHEET}'!$B${A_ANN_TAX_R}",
-        "2028F": f"'{ASSUMPTIONS_SHEET}'!$C${A_ANN_TAX_R}",
-        "2029F": f"'{ASSUMPTIONS_SHEET}'!$D${A_ANN_TAX_R}",
-    }
-    CAP_REF = {
-        "2026F": f"'{IM}'!{c2026}{cap_row}",
-        "2027F": f"'{ASSUMPTIONS_SHEET}'!$B${A_ANN_CAP_R}",
-        "2028F": f"'{ASSUMPTIONS_SHEET}'!$C${A_ANN_CAP_R}",
-        "2029F": f"'{ASSUMPTIONS_SHEET}'!$D${A_ANN_CAP_R}",
-    }
+    rev_row, gp_row = ir["Revenue"], ir["GrossProfit"]
+    opex_row, nonop_row = ir["OperatingExpenses"], ir["TotalNonoperatingIncomeAndExpense"]
+    pretax_row, tax_row = ir["PreTaxIncome"], ir["TAX"]
+    cap_row, nci_row = ir["OrdinaryShare"], ir["NoncontrollingInterests"]
+    imc = {yr: COL_LTR[yr] for yr in YRS}
+    rbc = {yr: RB_COL_LTR[yr] for yr in YRS}
+
+    PRIOR_YR = {"2026F": None, "2027F": "2026F", "2028F": "2027F", "2029F": "2028F"}
+    BASE_GROWTH = {yr: (f"'{IM}'!{imc[yr]}{rev_row}/'{IM}'!{COL_LTR['2025']}{rev_row}-1" if PRIOR_YR[yr] is None
+                        else f"'{IM}'!{imc[yr]}{rev_row}/'{IM}'!{imc[PRIOR_YR[yr]]}{rev_row}-1") for yr in YRS}
+    BASE_MARGIN = {yr: f"'{IM}'!{imc[yr]}{gp_row}/'{IM}'!{imc[yr]}{rev_row}" for yr in YRS}
+    OPEX_REF = {yr: f"'{IM}'!{imc[yr]}{opex_row}/'{IM}'!{imc[yr]}{rev_row}" for yr in YRS}
+    NONOP_REF = {yr: f"'{IM}'!{imc[yr]}{nonop_row}" for yr in YRS}
+    TAX_REF = {yr: f"'{IM}'!{imc[yr]}{tax_row}/'{IM}'!{imc[yr]}{pretax_row}" for yr in YRS}
+    CAP_REF = {yr: f"'{IM}'!{imc[yr]}{cap_row}" for yr in YRS}
+    NCI_REF = {yr: f"'{IM}'!{imc[yr]}{nci_row}" for yr in YRS}
     PRIOR_ACTUAL_REV = f"'{IM}'!{COL_LTR['2025']}{rev_row}"
 
-    # ── A. Scenario assumptions ────────────────────────────────────────────
-    _sec(ws, 3, "A. 情境假設 Scenario Assumptions — 黃色為可編輯假設 (Bull/Bear 為相對 Base 的調整幅度)", end_col=LAST_COL)
-    _hdr(4)
-    BASE_GROWTH_R, BULL_DELTA_R, BULL_GROWTH_R, BEAR_DELTA_R, BEAR_GROWTH_R = 5, 6, 7, 8, 9
-    _band_row_label(ws, BASE_GROWTH_R, "Base 營收成長率 YoY（連動主模型）", bold=True)
-    _band_row_label(ws, BULL_DELTA_R, "Bull 營收成長率調整 Δ（相對 Base）")
-    _band_row_label(ws, BULL_GROWTH_R, "Bull 營收成長率 YoY（= Base + Δ）", bold=True)
-    _band_row_label(ws, BEAR_DELTA_R, "Bear 營收成長率調整 Δ（相對 Base）")
-    _band_row_label(ws, BEAR_GROWTH_R, "Bear 營收成長率 YoY（= Base + Δ）", bold=True)
-    ws.row_dimensions[10].height = 6
-    BASE_MARGIN_R, BULL_MDELTA_R, BULL_MARGIN_R, BEAR_MDELTA_R, BEAR_MARGIN_R = 11, 12, 13, 14, 15
-    _band_row_label(ws, BASE_MARGIN_R, "Base 毛利率（連動主模型）", bold=True)
-    _band_row_label(ws, BULL_MDELTA_R, "Bull 毛利率調整 Δ（相對 Base）")
-    _band_row_label(ws, BULL_MARGIN_R, "Bull 毛利率（= Base + Δ）", bold=True)
-    _band_row_label(ws, BEAR_MDELTA_R, "Bear 毛利率調整 Δ（相對 Base）")
-    _band_row_label(ws, BEAR_MARGIN_R, "Bear 毛利率（= Base + Δ）", bold=True)
-    ws.row_dimensions[16].height = 6
+    # ── Row map ─────────────────────────────────────────────────────────────
+    R_NOTE = 3
+    R_SEC_A = 5
+    R_DEF = {"Base": 6, "Bull": 7, "Bear": 8, "Custom": 9}
+    R_SEC_B, R_HDR_B = 11, 12
+    R_BG, R_BULL_D, R_BULL_G, R_BEAR_G = 13, 14, 15, 16
+    R_BM, R_BULL_MD, R_BULL_M, R_BEAR_M = 18, 19, 20, 21
+    R_SEC_C, R_HDR_C = 23, 24
+    R_BULL, R_BASE, R_BEAR = 25, 31, 37            # 5-row P&L blocks: rev, gp, oi, ni, eps
+    assert R_BEAR + 4 == SC_BEAR_EPS_ROW
+    R_SEC_D, R_HDR_D = 43, 44
+    BULL_TP_R, BASE_TP_R, BEAR_TP_R = 45, 46, 47
+    CUR_PX_R, BULL_UP_R, BASE_UP_R, BEAR_DOWN_R = 49, 50, 51, 52
+    R_NOTE2 = 54
+    HIDDEN_BASE_R, SPAN_LO_R, SPAN_HI_R = 56, 57, 58
+    R_SEC_E, R_HDR_E = 60, 61
+    CU_G, CU_M, CU_OPEX, CU_NCI = 62, 63, 64, 65
+    CU_REV, CU_GP, CU_OI, CU_NI, CU_EPS = 67, 68, 69, 70, 71
+    CU_PE, CU_TP, CU_PX, CU_UP = 73, 74, 75, 76
+    R_SEC_F = 78
+    R_REASON = {"Bull": 79, "Base": 80, "Bear": 81, "Custom": 82}
+    R_SEC_G = 84
+    R_CHART = 86
 
-    for yr in SCENARIO_YEARS:
+    ws.row_dimensions[4].height = 6
+    ws.merge_cells(start_row=R_NOTE, start_column=1, end_row=R_NOTE, end_column=LAST_COL)
+    n0 = ws.cell(R_NOTE, 1,
+        "讀法：黃色格為可編輯輸入，其餘為公式。Base 直接讀主模型（Income Model 年度欄），不是另一份假設；"
+        "營業費用率、業外收支、稅率、股本、少數股權損益四個情境共用主模型數值。目標價 = 該情境 EPS x 目標本益比（PE Band 統計倍數）。")
+    n0.font = _f(size=8, color="7A0000"); n0.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[R_NOTE].height = 30
+
+    # ── A. Definitions ──────────────────────────────────────────────────────
+    _sec5(R_SEC_A, "A. 情境定義 Scenario Definitions")
+    _text_row(R_DEF["Base"], "Base", "主模型：既有業務加全部專案（依 Revenue Build E 段的得標機率）。")
+    _text_row(R_DEF["Bull"], "Bull", "Base 的營收成長率與毛利率各加上 B 段黃色的調整幅度 Δ。")
+    _text_row(R_DEF["Bear"], "Bear（全沒得標）",
+              "標案專案營收與維護費歸零，只留既有業務與電商訂單；毛利率 = 既有業務毛利率，營業費用 = 既有業務費用率與專案增額費用率分開算。")
+    _text_row(R_DEF["Custom"], "自訂 Custom", "見下方 E 段：各項假設自行輸入，預設連動 Base。")
+    ws.row_dimensions[R_SEC_B - 1].height = 6
+
+    # ── B. Assumptions ──────────────────────────────────────────────────────
+    _sec5(R_SEC_B, "B. 情境假設 Scenario Assumptions（Bull 為 Base ± Δ；Bear 由「全沒得標」推導，不可編輯）")
+    _hdr(R_HDR_B)
+    _band_row_label(ws, R_BG, "Base 營收成長率 YoY（連動主模型）", bold=True)
+    _band_row_label(ws, R_BULL_D, "Bull 營收成長率調整 Δ")
+    _band_row_label(ws, R_BULL_G, "Bull 營收成長率 YoY（= Base + Δ）", bold=True)
+    _band_row_label(ws, R_BEAR_G, "Bear 營收成長率 YoY（全沒得標，推導）", bold=True)
+    ws.row_dimensions[R_BEAR_G + 1].height = 6
+    _band_row_label(ws, R_BM, "Base 毛利率（連動主模型）", bold=True)
+    _band_row_label(ws, R_BULL_MD, "Bull 毛利率調整 Δ")
+    _band_row_label(ws, R_BULL_M, "Bull 毛利率（= Base + Δ）", bold=True)
+    _band_row_label(ws, R_BEAR_M, "Bear 毛利率（全沒得標，推導）", bold=True)
+    ws.row_dimensions[R_BEAR_M + 1].height = 6
+    for yr in YRS:
         col = SC_COL[yr]
-        _cell(BASE_GROWTH_R, yr, f"=IFERROR({BASE_GROWTH[yr]},\"\")", bold=True)
-        _cell(BULL_DELTA_R, yr, 0.05, editable=True)
-        _cell(BULL_GROWTH_R, yr, f"=IFERROR({col}{BASE_GROWTH_R}+{col}{BULL_DELTA_R},\"\")", bold=True)
-        _cell(BEAR_DELTA_R, yr, -0.05, editable=True)
-        _cell(BEAR_GROWTH_R, yr, f"=IFERROR({col}{BASE_GROWTH_R}+{col}{BEAR_DELTA_R},\"\")", bold=True)
-        _cell(BASE_MARGIN_R, yr, f"=IFERROR({BASE_MARGIN[yr]},\"\")", bold=True)
-        _cell(BULL_MDELTA_R, yr, 0.02, editable=True)
-        _cell(BULL_MARGIN_R, yr, f"=IFERROR({col}{BASE_MARGIN_R}+{col}{BULL_MDELTA_R},\"\")", bold=True)
-        _cell(BEAR_MDELTA_R, yr, -0.02, editable=True)
-        _cell(BEAR_MARGIN_R, yr, f"=IFERROR({col}{BASE_MARGIN_R}+{col}{BEAR_MDELTA_R},\"\")", bold=True)
+        _cell(R_BG, yr, f'=IFERROR({BASE_GROWTH[yr]},"")', bold=True)
+        _cell(R_BULL_D, yr, 0.05, editable=True)
+        _cell(R_BULL_G, yr, f'=IFERROR({col}{R_BG}+{col}{R_BULL_D},"")', bold=True)
+        _cell(R_BM, yr, f'=IFERROR({BASE_MARGIN[yr]},"")', bold=True)
+        _cell(R_BULL_MD, yr, 0.02, editable=True)
+        _cell(R_BULL_M, yr, f'=IFERROR({col}{R_BM}+{col}{R_BULL_MD},"")', bold=True)
 
-    # ── B. Scenario P&L ────────────────────────────────────────────────────
-    _sec(ws, 17, "B. 情境損益推算 Scenario P&L（營業費用率／業外收支／稅率／股本三情境共用主模型數值）", end_col=LAST_COL)
-    _hdr(18)
+    # ── C. Scenario P&L ─────────────────────────────────────────────────────
+    _sec5(R_SEC_C, "C. 情境損益推算 Scenario P&L（百萬元）")
+    _hdr(R_HDR_C)
 
-    def _pnl_block(base_row: int, growth_row: int, margin_row: int, label_prefix: str) -> dict:
-        rev_r, gp_r, oi_r, ni_r, eps_r = base_row, base_row + 1, base_row + 2, base_row + 3, base_row + 4
-        _band_row_label(ws, rev_r, f"{label_prefix}－營業收入淨額 Revenue (億元)", bold=True)
-        _band_row_label(ws, gp_r, f"{label_prefix}－營業毛利 Gross Profit (億元)")
-        _band_row_label(ws, oi_r, f"{label_prefix}－營業淨利 Operating Income (億元)")
-        _band_row_label(ws, ni_r, f"{label_prefix}－稅後淨利 Net Income (億元)")
-        _band_row_label(ws, eps_r, f"{label_prefix}－每股盈餘 EPS (元)", bold=True)
+    def _labels(base_row: int, prefix: str, ni_note: str = "（合併，未扣少數股權）") -> tuple:
+        r = (base_row, base_row + 1, base_row + 2, base_row + 3, base_row + 4)
+        _band_row_label(ws, r[0], f"{prefix}－營業收入淨額 Revenue (百萬元)", bold=True)
+        _band_row_label(ws, r[1], f"{prefix}－營業毛利 Gross Profit (百萬元)")
+        _band_row_label(ws, r[2], f"{prefix}－營業淨利 Operating Income (百萬元)")
+        _band_row_label(ws, r[3], f"{prefix}－稅後淨利{ni_note}Net Income (百萬元)")
+        _band_row_label(ws, r[4], f"{prefix}－每股盈餘 EPS (元)", bold=True)
+        return r
+
+    def _down_stream(rows: tuple, yr: str, opex_expr: str = None) -> None:
+        rev_r, gp_r, oi_r, ni_r, eps_r = rows
+        col = SC_COL[yr]
+        opex = opex_expr or f"{col}{rev_r}*({OPEX_REF[yr]})"
+        _cell(oi_r, yr, f'=IFERROR({col}{gp_r}-({opex}),"")', fmt=FMT_100M)
+        _cell(ni_r, yr, f'=IFERROR(({col}{oi_r}+({NONOP_REF[yr]}))*(1-({TAX_REF[yr]})),"")', fmt=FMT_100M)
+        _cell(eps_r, yr, f'=IFERROR(({col}{ni_r}-({NCI_REF[yr]}))/({CAP_REF[yr]})*10,"")', fmt=FMT_EPS, bold=True)
+
+    def _growth_block(base_row: int, growth_row: int, margin_row: int, prefix: str) -> tuple:
+        rows = _labels(base_row, prefix)
         prior_ref = PRIOR_ACTUAL_REV
-        for yr in SCENARIO_YEARS:
+        for yr in YRS:
             col = SC_COL[yr]
-            _cell(rev_r, yr, f'=IFERROR({prior_ref}*(1+{col}{growth_row}),"")', fmt=FMT_100M, bold=True)
-            _cell(gp_r, yr, f'=IFERROR({col}{rev_r}*{col}{margin_row},"")', fmt=FMT_100M)
-            _cell(oi_r, yr, f'=IFERROR({col}{gp_r}-{col}{rev_r}*({OPEX_REF[yr]}),"")', fmt=FMT_100M)
-            _cell(ni_r, yr, f'=IFERROR(({col}{oi_r}+({NONOP_REF[yr]}))*(1-({TAX_REF[yr]})),"")', fmt=FMT_100M)
-            _cell(eps_r, yr, f'=IFERROR({col}{ni_r}/({CAP_REF[yr]})*10,"")', fmt=FMT_EPS, bold=True)
-            prior_ref = f"{col}{rev_r}"
-        return {"rev": rev_r, "gp": gp_r, "oi": oi_r, "ni": ni_r, "eps": eps_r}
+            _cell(rows[0], yr, f'=IFERROR({prior_ref}*(1+{col}{growth_row}),"")', fmt=FMT_100M, bold=True)
+            _cell(rows[1], yr, f'=IFERROR({col}{rows[0]}*{col}{margin_row},"")', fmt=FMT_100M)
+            _down_stream(rows, yr)
+            prior_ref = f"{col}{rows[0]}"
+        return rows
 
-    bull_rows = _pnl_block(19, BULL_GROWTH_R, BULL_MARGIN_R, "Bull")
-    ws.row_dimensions[24].height = 6
-    base_rows = _pnl_block(25, BASE_GROWTH_R, BASE_MARGIN_R, "Base")
-    ws.row_dimensions[30].height = 6
-    bear_rows = _pnl_block(31, BEAR_GROWTH_R, BEAR_MARGIN_R, "Bear")
-    ws.row_dimensions[36].height = 6
+    bull_rows = _growth_block(R_BULL, R_BULL_G, R_BULL_M, "Bull")
+    ws.row_dimensions[R_BULL + 5].height = 6
+    base_rows = _growth_block(R_BASE, R_BG, R_BM, "Base")
+    ws.row_dimensions[R_BASE + 5].height = 6
 
-    # ── C. Implied valuation ───────────────────────────────────────────────
-    _sec(ws, 37, "C. 情境估值區間 Implied Valuation（EPS x PE Band 統計倍數：Bull=Mean+1SD／Base=Mean／Bear=Mean-1SD）", end_col=LAST_COL)
-    _hdr(38)
-    BULL_TP_R, BASE_TP_R, BEAR_TP_R = 39, 40, 41
+    # Bear: revenue / project gross profit come from Revenue Build's Bear rows; existing
+    # business gross profit = Income Model GP - total project GP (so no second margin input).
+    bear_rows = _labels(R_BEAR, "Bear")
+    prior_ref = PRIOR_ACTUAL_REV
+    for yr in YRS:
+        col = SC_COL[yr]
+        _cell(bear_rows[0], yr, f"='{RB}'!{rbc[yr]}{OV_BEAR_TOT}", fmt=FMT_100M, bold=True)
+        _cell(bear_rows[1], yr,
+              f"='{IM}'!{imc[yr]}{gp_row}-'{RB}'!{rbc[yr]}{OV_TOT_PROJ_GP}+'{RB}'!{rbc[yr]}{OV_BEAR_GP}",
+              fmt=FMT_100M)
+        # existing-business opex ratio implied by the Base column, applied to Bear existing revenue
+        proj_b = f"'{RB}'!{rbc[yr]}{OV_TOT_PROJ_REV}"
+        proj_bear = f"'{RB}'!{rbc[yr]}{OV_BEAR_PROJ_REV}"
+        inc = f"Assumptions!$B${A_PROJ_OPEX_R}"
+        exist_ratio = (f"(('{IM}'!{imc[yr]}{opex_row}-N({inc})*{proj_b})/('{IM}'!{imc[yr]}{rev_row}-{proj_b}))")
+        _down_stream(bear_rows, yr,
+                     opex_expr=f"({col}{bear_rows[0]}-{proj_bear})*{exist_ratio}+{proj_bear}*N({inc})")
+        _cell(R_BEAR_G, yr, f'=IFERROR({col}{bear_rows[0]}/{prior_ref}-1,"")', bold=True)
+        _cell(R_BEAR_M, yr, f'=IFERROR({col}{bear_rows[1]}/{col}{bear_rows[0]},"")', bold=True)
+        prior_ref = f"{col}{bear_rows[0]}"
+    ws.row_dimensions[R_BEAR + 5].height = 6
+
+    # ── D. Implied valuation ────────────────────────────────────────────────
+    _sec5(R_SEC_D, "D. 情境估值 Implied Valuation（EPS x PE Band 統計倍數：Bull = Mean+1SD／Base = Mean／Bear = Mean−1SD）")
+    _hdr(R_HDR_D)
     _band_row_label(ws, BULL_TP_R, "Bull 目標價 (元)", bold=True)
     _band_row_label(ws, BASE_TP_R, "Base 目標價 (元)", bold=True)
     _band_row_label(ws, BEAR_TP_R, "Bear 目標價 (元)", bold=True)
-    for yr in SCENARIO_YEARS:
+    for yr in YRS:
         col = SC_COL[yr]
-        _cell(BULL_TP_R, yr, f"=IFERROR({col}{bull_rows['eps']}*('PE Band'!{PE_BAND_MEAN_CELL}+'PE Band'!{PE_BAND_SD_CELL}),\"\")",
+        _cell(BULL_TP_R, yr, f"=IFERROR({col}{bull_rows[4]}*('PE Band'!{PE_BAND_MEAN_CELL}+'PE Band'!{PE_BAND_SD_CELL}),\"\")",
               fmt=FMT_PRICE, fill=FILL_FCAST_QTR, bold=True)
-        _cell(BASE_TP_R, yr, f"=IFERROR({col}{base_rows['eps']}*'PE Band'!{PE_BAND_MEAN_CELL},\"\")",
+        _cell(BASE_TP_R, yr, f"=IFERROR({col}{base_rows[4]}*'PE Band'!{PE_BAND_MEAN_CELL},\"\")",
               fmt=FMT_PRICE, fill=FILL_FCAST_QTR, bold=True)
-        _cell(BEAR_TP_R, yr, f"=IFERROR({col}{bear_rows['eps']}*('PE Band'!{PE_BAND_MEAN_CELL}-'PE Band'!{PE_BAND_SD_CELL}),\"\")",
+        _cell(BEAR_TP_R, yr, f"=IFERROR({col}{bear_rows[4]}*('PE Band'!{PE_BAND_MEAN_CELL}-'PE Band'!{PE_BAND_SD_CELL}),\"\")",
               fmt=FMT_PRICE, fill=FILL_FCAST_QTR, bold=True)
-
-    ws.row_dimensions[42].height = 6
-    CUR_PX_R, BULL_UP_R, BEAR_DOWN_R = 43, 44, 45
+    ws.row_dimensions[BEAR_TP_R + 1].height = 6
     _band_row_label(ws, CUR_PX_R, "目前股價 (元，引用 PE Band 最新收盤價)")
-    _band_row_label(ws, BULL_UP_R, "Bull 潛在漲幅 vs 目前股價")
-    _band_row_label(ws, BEAR_DOWN_R, "Bear 潛在跌幅 vs 目前股價")
-    for yr in SCENARIO_YEARS:
+    _band_row_label(ws, BULL_UP_R, "Bull 潛在漲跌幅 vs 目前股價")
+    _band_row_label(ws, BASE_UP_R, "Base 潛在漲跌幅 vs 目前股價")
+    _band_row_label(ws, BEAR_DOWN_R, "Bear 潛在漲跌幅 vs 目前股價")
+    for yr in YRS:
         col = SC_COL[yr]
         _cell(CUR_PX_R, yr, f"=IFERROR('PE Band'!$B${PE_BAND_LATEST_PRICE_ROW},\"\")", fmt=FMT_PRICE)
         _cell(BULL_UP_R, yr, f'=IFERROR({col}{BULL_TP_R}/{col}{CUR_PX_R}-1,"")', fmt=FMT_PCT)
+        _cell(BASE_UP_R, yr, f'=IFERROR({col}{BASE_TP_R}/{col}{CUR_PX_R}-1,"")', fmt=FMT_PCT)
         _cell(BEAR_DOWN_R, yr, f'=IFERROR({col}{BEAR_TP_R}/{col}{CUR_PX_R}-1,"")', fmt=FMT_PCT)
-
-    ws.row_dimensions[46].height = 6
-    ws.merge_cells(start_row=47, start_column=1, end_row=47, end_column=LAST_COL)
-    note = ws.cell(47, 1,
-        "說明：Base 情境直接連動主模型（Revenue Build／Income Model／Assumptions），不是另一份假設；"
-        "Bull／Bear 只需調整營收成長率與毛利率兩項，其餘假設（費用率／業外／稅率／股本）三情境共用，"
-        "為情境分析的標準簡化做法。目標價 = 該情境 EPS x PE Band 統計倍數，Bull/Bear 同時疊加較高/較低的 EPS 與較高/較低的本益比，"
-        "屬於較保守（雙重疊加）的區間估法。PE Band 的平均值/標準差若被手動覆寫，本頁會自動連動更新。")
-    note.font = _f(size=8, color="7A0000"); note.fill = FILL_CREAM
-    ws.row_dimensions[47].height = 26
-    ws.row_dimensions[48].height = 6
-
-    # ── Chart helper row (football-field range chart needs a hidden base-offset
-    # series + two stacked spans — not meant to be edited, just chart source data) ──
-    HIDDEN_BASE_R, SPAN_LO_R, SPAN_HI_R = 49, 50, 51
-    _band_row_label(ws, HIDDEN_BASE_R, "Bear 目標價 (圖表輔助列，勿刪除)")
-    _band_row_label(ws, SPAN_LO_R, "Bear→Base 區間 (圖表輔助列)")
-    _band_row_label(ws, SPAN_HI_R, "Base→Bull 區間 (圖表輔助列)")
-    for yr in SCENARIO_YEARS:
+    ws.row_dimensions[BEAR_DOWN_R + 1].height = 6
+    ws.merge_cells(start_row=R_NOTE2, start_column=1, end_row=R_NOTE2, end_column=LAST_COL)
+    n2 = ws.cell(R_NOTE2, 1,
+        "Bull／Bear 目標價同時疊加較高／較低的 EPS 與本益比，是較保守（雙重疊加）的區間估法。"
+        "PE Band 的平均值與標準差若手動覆寫，本頁自動連動。EPS 為負時，目標價也會是負值，不代表股價。")
+    n2.font = _f(size=8, color="666666"); n2.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[R_NOTE2].height = 26
+    ws.row_dimensions[R_NOTE2 + 1].height = 6
+    # chart source rows (football-field chart needs a transparent base + two stacked spans)
+    _band_row_label(ws, HIDDEN_BASE_R, "圖表輔助列：Bear 目標價（勿刪除）")
+    _band_row_label(ws, SPAN_LO_R, "圖表輔助列：Bear→Base 區間")
+    _band_row_label(ws, SPAN_HI_R, "圖表輔助列：Base→Bull 區間")
+    for yr in YRS:
         col = SC_COL[yr]
-        _cell(HIDDEN_BASE_R, yr, f"=IFERROR({col}{BEAR_TP_R},\"\")", fmt=FMT_PRICE)
+        _cell(HIDDEN_BASE_R, yr, f'=IFERROR({col}{BEAR_TP_R},"")', fmt=FMT_PRICE)
         _cell(SPAN_LO_R, yr, f'=IFERROR({col}{BASE_TP_R}-{col}{BEAR_TP_R},"")', fmt=FMT_PRICE)
         _cell(SPAN_HI_R, yr, f'=IFERROR({col}{BULL_TP_R}-{col}{BASE_TP_R},"")', fmt=FMT_PRICE)
-    ws.row_dimensions[52].height = 6
+    for rr in (HIDDEN_BASE_R, SPAN_LO_R, SPAN_HI_R):
+        ws.cell(rr, 1).font = _f(size=8, color="9A9186")
+    ws.row_dimensions[SPAN_HI_R + 1].height = 6
 
-    for r in range(1, 92):
-        for ci in range(1, 17):
-            ws.cell(r, ci).fill = FILL_CREAM
+    # ── E. Custom scenario ──────────────────────────────────────────────────
+    _sec5(R_SEC_E, "E. 自訂情境 Custom Scenario — 黃色格自行輸入絕對值（預設連動 Base，覆蓋即可）")
+    _hdr(R_HDR_E)
+    _band_row_label(ws, CU_G, "自訂營收成長率 YoY", bold=True)
+    _band_row_label(ws, CU_M, "自訂毛利率", bold=True)
+    _band_row_label(ws, CU_OPEX, "自訂營業費用率")
+    _band_row_label(ws, CU_NCI, "自訂少數股權損益 (百萬元，負數 = 少數股東分擔虧損)")
+    for yr in YRS:
+        col = SC_COL[yr]
+        _cell(CU_G, yr, f"={col}{R_BG}", editable=True, bold=True)
+        _cell(CU_M, yr, f"={col}{R_BM}", editable=True, bold=True)
+        _cell(CU_OPEX, yr, f'=IFERROR({OPEX_REF[yr]},"")', editable=True)
+        _cell(CU_NCI, yr, f'=IFERROR({NCI_REF[yr]},"")', fmt=FMT_100M, editable=True)
+    ws.row_dimensions[CU_NCI + 1].height = 6
+    cu_rows = (CU_REV, CU_GP, CU_OI, CU_NI, CU_EPS)
+    _band_row_label(ws, CU_REV, "自訂－營業收入淨額 Revenue (百萬元)", bold=True)
+    _band_row_label(ws, CU_GP, "自訂－營業毛利 Gross Profit (百萬元)")
+    _band_row_label(ws, CU_OI, "自訂－營業淨利 Operating Income (百萬元)")
+    _band_row_label(ws, CU_NI, "自訂－稅後淨利（合併，未扣少數股權）(百萬元)")
+    _band_row_label(ws, CU_EPS, "自訂－每股盈餘 EPS (元)", bold=True)
+    prior_ref = PRIOR_ACTUAL_REV
+    for yr in YRS:
+        col = SC_COL[yr]
+        _cell(CU_REV, yr, f'=IFERROR({prior_ref}*(1+{col}{CU_G}),"")', fmt=FMT_100M, bold=True)
+        _cell(CU_GP, yr, f'=IFERROR({col}{CU_REV}*{col}{CU_M},"")', fmt=FMT_100M)
+        _cell(CU_OI, yr, f'=IFERROR({col}{CU_GP}-{col}{CU_REV}*{col}{CU_OPEX},"")', fmt=FMT_100M)
+        _cell(CU_NI, yr, f'=IFERROR(({col}{CU_OI}+({NONOP_REF[yr]}))*(1-({TAX_REF[yr]})),"")', fmt=FMT_100M)
+        _cell(CU_EPS, yr, f'=IFERROR(({col}{CU_NI}-{col}{CU_NCI})/({CAP_REF[yr]})*10,"")', fmt=FMT_EPS, bold=True)
+        prior_ref = f"{col}{CU_REV}"
+    ws.row_dimensions[CU_EPS + 1].height = 6
+    _band_row_label(ws, CU_PE, "自訂目標本益比 Target P/E (x，預設 = PE Band 平均)")
+    _band_row_label(ws, CU_TP, "自訂目標價 (元) = EPS x 目標本益比", bold=True)
+    _band_row_label(ws, CU_PX, "目前股價 (元，引用 PE Band 最新收盤價)")
+    _band_row_label(ws, CU_UP, "自訂潛在漲跌幅 vs 目前股價")
+    for yr in YRS:
+        col = SC_COL[yr]
+        _cell(CU_PE, yr, f"='PE Band'!{PE_BAND_MEAN_CELL}", fmt=FMT_MULT, editable=True)
+        _cell(CU_TP, yr, f'=IFERROR({col}{CU_EPS}*{col}{CU_PE},"")', fmt=FMT_PRICE, fill=FILL_FCAST_QTR, bold=True)
+        _cell(CU_PX, yr, f"=IFERROR('PE Band'!$B${PE_BAND_LATEST_PRICE_ROW},\"\")", fmt=FMT_PRICE)
+        _cell(CU_UP, yr, f'=IFERROR({col}{CU_TP}/{col}{CU_PX}-1,"")', fmt=FMT_PCT)
+    ws.row_dimensions[CU_UP + 1].height = 6
 
-    # ── Charts (2x2 grid) ─────────────────────────────────────────────────────
-    cats_f = f"'{ws.title}'!$B$38:$E$38"
+    # ── F. Rationale ────────────────────────────────────────────────────────
+    _sec5(R_SEC_F, "F. 情境假設理由 Rationale — 每個情境寫一到兩句：為什麼這樣假設、依據是什麼、錯了會怎樣")
+    reasons = overlay.get("scenario_reasons", {})
+    for key, label in [("Bull", "Bull 理由"), ("Base", "Base 理由"), ("Bear", "Bear 理由"), ("Custom", "自訂情境理由")]:
+        _text_row(R_REASON[key], label, reasons.get(key, ""), editable=True)
+        ws.row_dimensions[R_REASON[key]].height = max(54, ws.row_dimensions[R_REASON[key]].height or 0)
+
+    # ── G. Charts (2 x 2) ───────────────────────────────────────────────────
+    _sec5(R_SEC_G, "G. 圖表 Charts")
+    cats_f = f"'{ws.title}'!$B${R_HDR_D}:$E${R_HDR_D}"
 
     def _apply_cats(ch) -> None:
         for s in ch.series:
@@ -2156,10 +2583,10 @@ def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None
             except Exception:
                 pass
 
-    R0 = 53
-    ANCHORS = [(f"A{R0}", f"J{R0}"), (f"A{R0 + CHART_ROW_GAP}", f"J{R0 + CHART_ROW_GAP}")]
+    LEFT, RIGHT = "A", "G"
+    ANCHORS = [(f"{LEFT}{R_CHART}", f"{RIGHT}{R_CHART}"),
+               (f"{LEFT}{R_CHART + CHART_ROW_GAP}", f"{RIGHT}{R_CHART + CHART_ROW_GAP}")]
 
-    # 1. Target price trend (top-left)
     ch1 = LineChart()
     for row, label, color in [(BULL_TP_R, "Bull 目標價", PALETTE[1]), (BASE_TP_R, "Base 目標價", ACCENT_PRICE),
                                (BEAR_TP_R, "Bear 目標價", PALETTE[2]), (CUR_PX_R, "目前股價", "1A1A1A")]:
@@ -2172,11 +2599,10 @@ def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None
     _style_chart(ch1, "情境目標價趨勢 Scenario Target Price", FMT_PRICE, legend=True)
     ws.add_chart(ch1, ANCHORS[0][0])
 
-    # 2. EPS comparison (top-right)
     ch2 = BarChart()
     ch2.type = "col"; ch2.grouping = "clustered"
-    for row, label, color in [(bull_rows["eps"], "Bull EPS", PALETTE[1]), (base_rows["eps"], "Base EPS", PALETTE[0]),
-                               (bear_rows["eps"], "Bear EPS", PALETTE[2])]:
+    for row, label, color in [(bull_rows[4], "Bull EPS", PALETTE[1]), (base_rows[4], "Base EPS", PALETTE[0]),
+                               (bear_rows[4], "Bear EPS", PALETTE[2])]:
         ref = Reference(ws, min_col=2, max_col=LAST_COL, min_row=row, max_row=row)
         ch2.add_data(ref, from_rows=True)
         s = ch2.series[len(ch2.series) - 1]
@@ -2186,10 +2612,10 @@ def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None
     _style_chart(ch2, "情境 EPS 比較 Scenario EPS", FMT_EPS, legend=True)
     ws.add_chart(ch2, ANCHORS[0][1])
 
-    # 3. Upside / downside % (bottom-left)
     ch3 = BarChart()
     ch3.type = "col"; ch3.grouping = "clustered"
-    for row, label, color in [(BULL_UP_R, "Bull 潛在漲幅", PALETTE[1]), (BEAR_DOWN_R, "Bear 潛在跌幅", PALETTE[2])]:
+    for row, label, color in [(BULL_UP_R, "Bull 漲跌幅", PALETTE[1]), (BASE_UP_R, "Base 漲跌幅", PALETTE[0]),
+                               (BEAR_DOWN_R, "Bear 漲跌幅", PALETTE[2])]:
         ref = Reference(ws, min_col=2, max_col=LAST_COL, min_row=row, max_row=row)
         ch3.add_data(ref, from_rows=True)
         s = ch3.series[len(ch3.series) - 1]
@@ -2199,8 +2625,6 @@ def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None
     _style_chart(ch3, "潛在漲跌幅 Upside / Downside vs 目前股價", FMT_PCT, legend=True)
     ws.add_chart(ch3, ANCHORS[1][0])
 
-    # 4. Football-field target price range (bottom-right) — stacked bar with a
-    # transparent base-offset series so each column floats from Bear to Bull price.
     ch4 = BarChart()
     ch4.type = "col"; ch4.grouping = "stacked"; ch4.overlap = 100
     for row, label, color, hidden in [(HIDDEN_BASE_R, "(隱藏基準)", None, True),
@@ -2220,13 +2644,248 @@ def build_scenario_analysis_sheet(wb: Workbook, stock_id: str, ir: dict) -> None
             _style_series_bar(s, color)
     _apply_cats(ch4)
     _style_chart(ch4, "情境目標價區間 Target Price Range (Bear-Base-Bull)", FMT_PRICE, legend=True)
-    ch4.legend.legendEntry = [LegendEntry(idx=0, delete=True)]   # hide the invisible offset series' entry
+    ch4.legend.legendEntry = [LegendEntry(idx=0, delete=True)]
     ws.add_chart(ch4, ANCHORS[1][1])
 
-    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["A"].width = 46
     for col in ["B", "C", "D", "E"]:
         ws.column_dimensions[col].width = 13
-    ws.freeze_panes = "B5"
+    ws.column_dimensions["F"].width = 3
+    ws.freeze_panes = "B1"
+
+
+def build_sotp_sheet(wb: Workbook, stock_id: str, ir: dict, overlay: dict | None = None) -> None:
+    """Probability-weighted sum-of-the-parts valuation (百萬元 / 元).
+
+    Existing business = book value x PB multiple. Each project from Revenue Build section E
+    is valued as the discounted after-tax profit of its revenue plus its maintenance-fee
+    stream (explicit years 2026F-2029F, terminal multiple on the last year's maintenance
+    profit), then weighted by a win probability. Three cases share one set of numbers:
+    all won (probability 100%), probability-weighted, and no tender won (Bear: projects
+    flagged `Bear 歸零` dropped). All yellow cells are the researcher's judgement; the
+    defaults are placeholders, not estimates, and are flagged as such on the sheet."""
+    ws = wb.create_sheet(SOTP_SHEET)
+    ws.sheet_properties.tabColor = "7A0000"
+    overlay = overlay or {}
+    sp = overlay.get("sotp", {})
+    RB, IM = REVENUE_BUILD_SHEET, INCOME_MODEL_SHEET
+    YRS = ["2026F", "2027F", "2028F", "2029F"]
+    COLS = {"2026F": "B", "2027F": "C", "2028F": "D", "2029F": "E"}
+    LAST_COL = 6                                          # F = present value / total
+    rbc = {y: RB_COL_LTR[y] for y in YRS}
+
+    for r in range(1, 100):
+        for ci in range(1, 9):
+            ws.cell(r, ci).fill = FILL_CREAM
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=LAST_COL)
+    t = ws.cell(1, 1, f"{stock_id}  機率加權分部估值 Probability-weighted SOTP   單位：新台幣百萬元（每股價值為元）")
+    t.font = _f(bold=True, size=12, color="7A0000"); t.alignment = ALIGN_C
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = 6
+
+    def _hdr(row: int, first: str = "項目 Item", last: str = "現值") -> None:
+        h = ws.cell(row, 1, first)
+        h.font = _f(bold=True, size=9, color="FFFFFF"); h.fill = FILL_WINE; h.alignment = ALIGN_C; h.border = BORDER_D
+        for y in YRS:
+            c = ws[f"{COLS[y]}{row}"]
+            c.value = y.replace("F", "(F)")
+            c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE; c.alignment = ALIGN_C; c.border = BORDER_D
+        c = ws.cell(row, LAST_COL, last)
+        c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE; c.alignment = ALIGN_C; c.border = BORDER_D
+        ws.row_dimensions[row].height = 16
+
+    def _put(cell: str, value, fmt: str = FMT_100M, bold: bool = False, editable: bool = False, fill=None) -> None:
+        c = ws[cell]
+        c.value = value
+        c.number_format = fmt; c.alignment = ALIGN_R; c.font = _f(bold=bold, size=9)
+        c.fill = fill if fill is not None else (FILL_INPUT if editable else FILL_CREAM)
+        c.border = BORDER_HL if bold else BORDER_D
+
+    def _note(row: int, col_from: int, text: str, color: str = "7A0000") -> None:
+        ws.merge_cells(start_row=row, start_column=col_from, end_row=row, end_column=LAST_COL)
+        c = ws.cell(row, col_from, text)
+        c.font = _f(size=8, color=color); c.alignment = ALIGN_L_WRAP
+
+    # ── A. Inputs ───────────────────────────────────────────────────────────
+    _sec(ws, 3, "A. 輸入假設（黃色為研究員判斷；預設值是佔位，不是估計，請自行決定）", end_col=LAST_COL)
+    R_DISC, R_OPEX, R_TAX, R_MULT, R_PB = 4, 5, 6, 7, 8
+    inputs = [
+        (R_DISC, "貼現率", sp.get("discount", 0.10), FMT_PCT, "佔位。標案利潤逐年折現到今天，年份指數 = 年度 − 2026"),
+        (R_OPEX, "標案增額營業費用率（佔標案營收）", f"=Assumptions!$B${A_PROJ_OPEX_R}", FMT_PCT, "連動 Assumptions 的「專案增額營業費用率」（佔位），主模型與本頁共用同一個數字，改 Assumptions 那格即可"),
+        (R_TAX, "標案稅率", sp.get("tax", 0.20), FMT_PCT, "營利事業所得稅法定稅率 20%；主模型稅率預設值未調整，這裡不使用"),
+        (R_MULT, "維護費終值倍數 (x)", sp.get("maint_multiple", 10.0), FMT_MULT, "佔位。2029F 維護費稅後利潤 x 倍數 = 2030 年以後的價值，並假設 2030 年後維持 2029 年水準"),
+        (R_PB, "既有業務 PB (x)", sp.get("existing_pb", "='PB Band'!$B$4"), FMT_MULT, "預設連動 PB Band 平均 PBR（近五年日資料），可覆蓋。帳面價值用 26Q2 實績 BVPS，不含專案未來獲利，避免與專案價值重複計算"),
+    ]
+    for row, label, val, fmt, remark in inputs:
+        _band_row_label(ws, row, label)
+        _put(f"B{row}", val, fmt, editable=True)
+        _note(row, 3, remark, "666666")
+        ws.row_dimensions[row].height = 26
+    R_PX, R_SH, R_BV = 9, 10, 11
+    cap_row = ir["OrdinaryShare"]
+    pb_keys = BAND_QTR_KEYS
+    bv_col = get_column_letter(2 + pb_keys.index(LAST_ACTUAL_KEY))
+    for row, label in [(R_PX, "目前股價 (元，引用 PE Band 最新收盤價)"), (R_SH, "股數 (百萬股 = 普通股本 ÷ 10)"),
+                       (R_BV, "每股淨值 BVPS (元，最近一季實績，引用 PB Band)")]:
+        _band_row_label(ws, row, label)
+    _put(f"B{R_PX}", f"=IFERROR('PE Band'!$B${PE_BAND_LATEST_PRICE_ROW},\"\")", FMT_PRICE)
+    _put(f"B{R_SH}", f"=IFERROR('{IM}'!{COL_LTR[LAST_ACTUAL_KEY]}{cap_row}/10,\"\")", FMT_100M)
+    _put(f"B{R_BV}", f"=IFERROR('PB Band'!{bv_col}12,\"\")", FMT_PRICE)
+    ws.row_dimensions[12].height = 6
+
+    # ── B. Discount factors ─────────────────────────────────────────────────
+    _sec(ws, 13, "B. 折現係數", end_col=LAST_COL)
+    _hdr(14, last="")
+    R_DF = 15
+    _band_row_label(ws, R_DF, "折現係數 = 1 ÷ (1 + 貼現率) ^ (年度 − 2026)")
+    for i, y in enumerate(YRS):
+        _put(f"{COLS[y]}{R_DF}", f"=1/(1+$B${R_DISC})^{i}", "0.000")
+    ws.row_dimensions[16].height = 6
+
+    # ── C. Per-project values (if won in full) ─────────────────────────────
+    _sec(ws, 17, "C. 各專案價值（得標後全額認列；機率在 D 段才套用）", end_col=LAST_COL)
+    B0 = 18
+    BLK = 8
+    blk = {}
+    rate_ref, mgm_ref = f"'{RB}'!$B${OV_MAINT_RATE}", f"'{RB}'!$B${OV_MAINT_GM}"
+    for i in range(OV_N):
+        r0 = B0 + BLK * i
+        rr = OV_P0 + OV_BLK * i                          # Revenue Build block start row
+        name_r, prob_r, gm_r, flag_r, bear_r, amt_r = rr, rr + 1, rr + 2, rr + 3, rr + 4, rr + 5
+        rows = dict(name=r0, prob=r0 + 1, rev=r0 + 2, pft=r0 + 3, mrev=r0 + 4, mpft=r0 + 5, tot=r0 + 6)
+        blk[i] = dict(rows, rb_prob=prob_r, rb_bear=bear_r, rb_flag=flag_r)
+        nm = f"'{RB}'!$B${name_r}"
+        c = ws.cell(rows["name"], 1, f'=IF({nm}="","專案 {i + 1}（未設定）",IFERROR(LEFT({nm},FIND("｜",{nm})-1),{nm}))')
+        c.font = _f(bold=True, size=9); c.fill = FILL_SUB_HDR if False else FILL_CREAM; c.alignment = ALIGN_L; c.border = BORDER_HL
+        ws.merge_cells(start_row=rows["name"], start_column=1, end_row=rows["name"], end_column=LAST_COL)
+        _hdr_row = rows["name"]
+        _band_row_label(ws, rows["prob"], "　得標機率（預設連動 Revenue Build，可覆蓋）")
+        _put(f"B{rows['prob']}", f"=IFERROR('{RB}'!$B${prob_r},\"\")", FMT_PCT, editable=True)
+        _band_row_label(ws, rows["rev"], "　專案營收 if won (百萬元)")
+        _band_row_label(ws, rows["pft"], "　專案稅後利潤 if won = 營收 x (毛利率 − 費用率) x (1 − 稅率)")
+        _band_row_label(ws, rows["mrev"], "　維護費營收 if won = 費率 x 適用 x 前幾年累計營收")
+        _band_row_label(ws, rows["mpft"], "　維護費稅後利潤（含終值）")
+        _band_row_label(ws, rows["tot"], "　專案合計現值 if won (百萬元)", bold=True)
+        cum = []
+        for j, y in enumerate(YRS):
+            col = COLS[y]
+            _put(f"{col}{rows['rev']}", f"=N('{RB}'!{rbc[y]}{amt_r})")
+            _put(f"{col}{rows['pft']}",
+                 f"={col}{rows['rev']}*(N('{RB}'!$B${gm_r})-$B${R_OPEX})*(1-$B${R_TAX})")
+            prior = "+".join(f"{COLS[p]}{rows['rev']}" for p in YRS[:j]) or "0"
+            _put(f"{col}{rows['mrev']}", f"=N({rate_ref})*N('{RB}'!$B${flag_r})*({prior})")
+            _put(f"{col}{rows['mpft']}", f"={col}{rows['mrev']}*(N({mgm_ref})-$B${R_OPEX})*(1-$B${R_TAX})")
+        _put(f"F{rows['pft']}", f"=SUMPRODUCT(B{rows['pft']}:E{rows['pft']},$B${R_DF}:$E${R_DF})", bold=True)
+        _put(f"F{rows['mpft']}",
+             f"=SUMPRODUCT(B{rows['mpft']}:E{rows['mpft']},$B${R_DF}:$E${R_DF})+$B${R_MULT}*E{rows['mpft']}*$E${R_DF}", bold=True)
+        _put(f"F{rows['tot']}", f"=F{rows['pft']}+F{rows['mpft']}", bold=True, fill=FILL_FCAST_QTR)
+        ws.row_dimensions[r0 + 7].height = 6
+    R_END_C = B0 + BLK * OV_N
+
+    # ── D. Summary ──────────────────────────────────────────────────────────
+    R_SEC_D = R_END_C
+    _sec(ws, R_SEC_D, "D. 分部估值彙總（三種情況）", end_col=LAST_COL)
+    R_HD = R_SEC_D + 1
+    for ci, txt in enumerate(["項目 Item", "全得標（機率 100%）", "機率加權", "全沒得標 Bear"], start=1):
+        c = ws.cell(R_HD, ci, txt)
+        c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE; c.alignment = ALIGN_C; c.border = BORDER_D
+    ws.row_dimensions[R_HD].height = 16
+    R_EX = R_HD + 1
+    _band_row_label(ws, R_EX, "既有業務 = BVPS x PB x 股數 (百萬元)", bold=True)
+    for col in "BCD":
+        _put(f"{col}{R_EX}", f"=IFERROR($B${R_BV}*$B${R_PB}*$B${R_SH},\"\")", bold=True)
+    proj_rows = []
+    for i in range(OV_N):
+        row = R_EX + 1 + i
+        proj_rows.append(row)
+        b = blk[i]
+        ws.cell(row, 1, f"=A{b['name']}").font = _f(size=9)
+        ws.cell(row, 1).fill = FILL_CREAM; ws.cell(row, 1).alignment = ALIGN_L; ws.cell(row, 1).border = BORDER_D
+        _put(f"B{row}", f"=N(F{b['tot']})")
+        _put(f"C{row}", f"=N(F{b['tot']})*N($B${b['prob']})")
+        _put(f"D{row}", f"=N(F{b['tot']})*N($B${b['prob']})*(1-N('{RB}'!$B${b['rb_bear']}))")
+    R_TP = R_EX + 1 + OV_N
+    _band_row_label(ws, R_TP, "專案與維護費現值合計 (百萬元)", bold=True)
+    R_EQ, R_PS, R_UP = R_TP + 1, R_TP + 2, R_TP + 3
+    _band_row_label(ws, R_EQ, "權益價值合計 (百萬元)", bold=True)
+    _band_row_label(ws, R_PS, "每股價值 (元)", bold=True)
+    _band_row_label(ws, R_UP, "潛在漲跌幅 vs 目前股價", bold=True)
+    for col in "BCD":
+        _put(f"{col}{R_TP}", f"=SUM({col}{proj_rows[0]}:{col}{proj_rows[-1]})", bold=True)
+        _put(f"{col}{R_EQ}", f"=IFERROR({col}{R_EX}+{col}{R_TP},\"\")", bold=True)
+        _put(f"{col}{R_PS}", f"=IFERROR({col}{R_EQ}/$B${R_SH},\"\")", FMT_PRICE, bold=True, fill=FILL_FCAST_QTR)
+        _put(f"{col}{R_UP}", f"=IFERROR({col}{R_PS}/$B${R_PX}-1,\"\")", FMT_PCT, bold=True)
+    ws.row_dimensions[R_UP + 1].height = 6
+    # ── E. Forward PB method (no double counting) ───────────────────────────
+    # Book value at end-2028 already contains every project's retained after-tax profit, so
+    # it is valued on its own (never added to the project present values above).
+    R_XC = R_UP + 2
+    _sec(ws, R_XC, "E. 前瞻 PB 法：2028 年底帳面價值 x 平均 PBR（已含專案累積獲利，不與上表加總）", end_col=LAST_COL)
+    for ci, txt in enumerate(["項目 Item", "全得標（機率 100%）", "機率加權", "全沒得標 Bear"], start=1):
+        c = ws.cell(R_XC + 1, ci, txt)
+        c.font = _f(bold=True, size=9, color="FFFFFF"); c.fill = FILL_WINE; c.alignment = ALIGN_C; c.border = BORDER_D
+    ws.row_dimensions[R_XC + 1].height = 16
+    pb_last_col = get_column_letter(2 + len(BAND_QTR_KEYS))
+    eps_row = ir["EPS"]
+    payout = "Assumptions!$B$" + str(A_PAYOUT_R)
+    sc = f"'{SCENARIO_SHEET}'!"
+    eps_1h = f"('{IM}'!{COL_LTR['26Q1']}{eps_row}+'{IM}'!{COL_LTR['26Q2']}{eps_row})"
+    # tender weight of the probability-weighted case: revenue-weighted average win probability
+    # of the tender-flagged projects (2027-2028 revenue if won)
+    num = "+".join(f"N('{RB}'!$B${blk[i]['rb_bear']})*N($B${blk[i]['prob']})*(C{blk[i]['rev']}+D{blk[i]['rev']})" for i in range(OV_N))
+    den = "+".join(f"N('{RB}'!$B${blk[i]['rb_bear']})*(C{blk[i]['rev']}+D{blk[i]['rev']})" for i in range(OV_N))
+    R_W, R_EB, R_BV_, R_PBR, R_V28, R_PVP, R_DIV, R_PS2, R_UP2 = [R_XC + 2 + k for k in range(9)]
+    for row, lbl, bold in [
+        (R_W, "機率加權情況的標案權重（標案營收加權平均得標機率）", False),
+        (R_EB, "2026 下半年到 2028 累積歸屬母公司 EPS (元)", False),
+        (R_BV_, "2028 年底預測 BVPS (元) = 26Q2 BVPS + 累積 EPS x (1 − 發放率)", False),
+        (R_PBR, "x 平均 PBR (x，同上方既有業務 PB)", False),
+        (R_V28, "2028 年底每股價值 (元，未折現)", True),
+        (R_PVP, "折現到今天 = 2028 年底價值 x 2028 折現係數", False),
+        (R_DIV, "加：2026 到 2028 年股利現值 = 發放率 x 各年 EPS x 折現係數", False),
+        (R_PS2, "每股價值 (元，折現後含股利)", True),
+        (R_UP2, "潛在漲跌幅 vs 目前股價", True),
+    ]:
+        _band_row_label(ws, row, lbl, bold=bold)
+    _put(f"C{R_W}", f"=IFERROR(({num})/({den}),0)", FMT_PCT)
+    # per-year EPS: full = Income Model annual, bear = Scenario Bear row
+    yc = {"2026F": "B", "2027F": "C", "2028F": "D"}
+    full_eps = {y: f"'{IM}'!{COL_LTR[y]}{eps_row}" for y in yc}
+    bear_eps = {y: f"{sc}{yc[y]}{SC_BEAR_EPS_ROW}" for y in yc}
+    def _case_eps(col: str, y: str) -> str:
+        if col == "B":
+            return full_eps[y]
+        if col == "D":
+            return bear_eps[y]
+        return f"({bear_eps[y]}+({full_eps[y]}-{bear_eps[y]})*$C${R_W})"
+    for col in "BCD":
+        cum = "+".join(f"{_case_eps(col, y)}" for y in yc) + f"-{eps_1h}"
+        _put(f"{col}{R_EB}", f"=IFERROR({cum},\"\")", FMT_EPS)
+        _put(f"{col}{R_BV_}", f"=IFERROR($B${R_BV}+{col}{R_EB}*(1-{payout}),\"\")", FMT_PRICE)
+        _put(f"{col}{R_PBR}", f"=$B${R_PB}", FMT_MULT)
+        _put(f"{col}{R_V28}", f"=IFERROR({col}{R_BV_}*{col}{R_PBR},\"\")", FMT_PRICE, bold=True)
+        _put(f"{col}{R_PVP}", f"=IFERROR({col}{R_V28}*$D${R_DF},\"\")", FMT_PRICE)
+        divs = "+".join(f"{_case_eps(col, y)}*${yc[y]}${R_DF}" for y in yc)
+        _put(f"{col}{R_DIV}", f"=IFERROR({payout}*({divs}),\"\")", FMT_PRICE)
+        _put(f"{col}{R_PS2}", f"=IFERROR({col}{R_PVP}+{col}{R_DIV},\"\")", FMT_PRICE, bold=True, fill=FILL_FCAST_QTR)
+        _put(f"{col}{R_UP2}", f"=IFERROR({col}{R_PS2}/$B${R_PX}-1,\"\")", FMT_PCT, bold=True)
+    ws.row_dimensions[R_UP2 + 1].height = 6
+    R_NOTE = R_UP2 + 2
+    ws.merge_cells(start_row=R_NOTE, start_column=1, end_row=R_NOTE, end_column=LAST_COL)
+    n = ws.cell(R_NOTE, 1,
+        "說明：D 段與 E 段是兩種獨立的估法，請擇一使用，不要加總。E 段的全得標用主模型 EPS（含主模型稅率），"
+        "全沒得標用 Scenario Bear EPS，機率加權為兩者依標案權重內插；D 段的專案稅後利潤用本頁稅率與費用率。三種情況用同一組數字。全沒得標只保留 Revenue Build 中「Bear 歸零」為 0 的專案（如電商訂單），並套用它們的機率。"
+        "標案利潤假設全部歸屬母公司，未扣少數股權；維護費只計到 2029F，之後以終值倍數一次估算；"
+        "標案營收是一次性的，這裡以折現後稅後利潤估值，不乘用歷史本益比。所有黃色輸入格的預設值請自行確認後再用。")
+    n.font = _f(size=8, color="7A0000"); n.alignment = ALIGN_L_WRAP
+    ws.row_dimensions[R_NOTE].height = 42
+
+    ws.column_dimensions["A"].width = 58
+    for col in "BCDE":
+        ws.column_dimensions[col].width = 15
+    ws.column_dimensions["F"].width = 16
+    ws.freeze_panes = "B3"
 
 
 # ── Build Backtest ─────────────────────────────────────────────────────────────
@@ -2444,7 +3103,7 @@ def payout_ratio_default(dividend_df: pd.DataFrame | None, data: dict) -> float 
         cash  = float(pd.to_numeric(g.get("CashEarningsDistribution"), errors="coerce").fillna(0).sum())
         stock = float(pd.to_numeric(g.get("StockEarningsDistribution"), errors="coerce").fillna(0).sum())
         eps = _annual_eps_complete(data, f"{year % 100:02d}")
-        if eps:
+        if eps and eps > 0:
             ratios.append((cash + stock) / eps)
     if not ratios:
         return None
@@ -2565,7 +3224,7 @@ def build_turnover_sheet(wb: Workbook, stock_id: str, data: dict, bs_extra: dict
     ws.row_dimensions[1].height = 22
     ws.row_dimensions[2].height = 6
 
-    _sec(ws, 3, "資產負債表餘額 (億元，來源：FinMind)", end_col=last_col)
+    _sec(ws, 3, "資產負債表餘額 (百萬元，來源：FinMind)", end_col=last_col)
     _band_quarter_header(ws, 4, keys)
     INV_R, AR_R, AP_R = 5, 6, 7
     for row, label in [(INV_R, "存貨"), (AR_R, "應收帳款淨額"), (AP_R, "應付帳款")]:
@@ -2703,13 +3362,18 @@ def process_stock(stock_id: str, start_year: int) -> None:
 
     print(f"[{stock_id}] Building Excel...")
     wb     = Workbook()
+    overlay = load_overlay(stock_id)
+    if overlay:
+        print(f"[{stock_id}] Using project overlay: data/overlays/{stock_id}.json")
     layout = build_model_sheet(wb, stock_id, data)
-    build_assumptions_sheet(wb, stock_id, data, payout_def, BAND_LOOKBACK_YEARS)
-    build_revenue_build_sheet(wb, stock_id, layout["item_row"], data)
+    build_assumptions_sheet(wb, stock_id, data, payout_def, BAND_LOOKBACK_YEARS, overlay)
+    build_revenue_build_sheet(wb, stock_id, layout["item_row"], data, overlay)
     build_dashboard_sheet(wb, stock_id, layout)
-    build_pe_band_sheet(wb, stock_id, layout["item_row"], data, price_df, per_df, BAND_LOOKBACK_YEARS)
+    build_pe_band_sheet(wb, stock_id, layout["item_row"], data, price_df, per_df, BAND_LOOKBACK_YEARS, overlay)
     build_pb_band_sheet(wb, stock_id, layout["item_row"], data, bs_extra, price_df, per_df, BAND_LOOKBACK_YEARS)
-    build_scenario_analysis_sheet(wb, stock_id, layout["item_row"])
+    build_scenario_analysis_sheet(wb, stock_id, layout["item_row"], overlay)
+    build_sotp_sheet(wb, stock_id, layout["item_row"], overlay)
+    wb.move_sheet(SOTP_SHEET, offset=-1)   # SOTP sits before Scenario Analysis (researcher's preferred order)
     build_backtest_sheet(wb, stock_id, price_df, per_df, BAND_LOOKBACK_YEARS)
     build_dividend_sheet(wb, stock_id, data, dividend_df, price_df)
     build_turnover_sheet(wb, stock_id, data, bs_extra)
